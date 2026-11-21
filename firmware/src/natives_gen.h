@@ -108,7 +108,9 @@ enum NativeId {
   N_esp32_screen_ScreenKt_tftText_IILjava_lang_String_III_V = 102,
   N_esp32_screen_ScreenKt_tftInvert_Z_V = 103,
   N_esp32_screen_ScreenKt_tftBacklight_Z_V = 104,
-  N_COUNT = 105
+  N_esp32_Esp32Kt_deviceConfig_Ljava_lang_String_Ljava_lang_String = 105,
+  N_esp32_Esp32Kt_deviceId_Ljava_lang_String = 106,
+  N_COUNT = 107
 };
 
 static const uint8_t native_argslots[] = {
@@ -217,6 +219,8 @@ static const uint8_t native_argslots[] = {
   6, // esp32/screen/ScreenKt.tftText(IILjava/lang/String;III)V
   1, // esp32/screen/ScreenKt.tftInvert(Z)V
   1, // esp32/screen/ScreenKt.tftBacklight(Z)V
+  1, // esp32/Esp32Kt.deviceConfig(Ljava/lang/String;)Ljava/lang/String;
+  0, // esp32/Esp32Kt.deviceId()Ljava/lang/String;
 };
 static const uint8_t native_retslots[] = {
   0,
@@ -324,6 +328,8 @@ static const uint8_t native_retslots[] = {
   0,
   0,
   0,
+  1,
+  1,
 };
 static const char* const native_names[] = {
   "java/lang/Object.<init>()V",
@@ -431,4 +437,6 @@ static const char* const native_names[] = {
   "esp32/screen/ScreenKt.tftText(IILjava/lang/String;III)V",
   "esp32/screen/ScreenKt.tftInvert(Z)V",
   "esp32/screen/ScreenKt.tftBacklight(Z)V",
+  "esp32/Esp32Kt.deviceConfig(Ljava/lang/String;)Ljava/lang/String;",
+  "esp32/Esp32Kt.deviceId()Ljava/lang/String;",
 };

@@ -183,12 +183,11 @@ def read_until(ser, token, timeout):
         buf += ser.read(4096)
 
 
-def upload(path, port):
-    data = open(path, "rb").read()
+def connect_device(port):
+    """Opens the board's serial port. Opening it often resets the board (DTR/RTS glitch): if it is booting,
+    wait for the banner so the next command is not lost."""
     ser = open_serial(find_port(port))
-    log(f"uploading {len(data)} bytes to {ser.port}")
     t = time.time()
-    # Opening the port often resets the board (DTR/RTS glitch): if it is booting, wait for the banner.
     boot = b""
     quiet_until = time.time() + 0.4
     while time.time() < quiet_until:
@@ -199,7 +198,16 @@ def upload(path, port):
                 time.sleep(0.3)
                 break
             quiet_until = max(quiet_until, min(time.time() + 0.5, t + 5))
-    ser.reset_input_buffer()
+    if boot:
+        _pending[id(ser)] = boot   # keep the boot messages for whoever reads next
+    return ser
+
+
+def upload(path, port):
+    data = open(path, "rb").read()
+    ser = connect_device(port)
+    log(f"uploading {len(data)} bytes to {ser.port}")
+    t = time.time()
     ser.write(MAGIC_UPLOAD + struct.pack("<II", len(data), zlib.crc32(data) & 0xFFFFFFFF))
     read_until(ser, b"[ktvm] ready", 6)
     chunk = 512
@@ -252,29 +260,57 @@ def screen_cmd(a):
     img = None
     if a.files:
         img = a.files[0] if a.files[0].endswith(".ktv") else compile_and_link(a.files)
-    use_sim = a.sim
-    if not use_sim and not a.port:
-        try:
-            find_port(None)
-        except Fail:
-            if not img:
-                raise
-            log("no ESP32 connected: using the desktop simulator (--sim)")
-            use_sim = True
     parser = screen.make_parser()
-    if use_sim:
+    if a.sim:
         if not img:
             raise Fail("--sim needs a program (.kt files, folder or .ktv)")
         build_sim()
-        src = screen.SimSource(SIM, img, parser)
+        src = screen.SimSource(SIM, img, parser, sim_args(a))
     else:
-        if img:
-            ser = upload(img, a.port)
-        else:
-            ser = open_serial(find_port(a.port))
-        src = screen.SerialSource(ser, parser, _pending.pop(id(ser), b""))
+        # Real board, with hot-plug: the window shows a black (unpowered) display until an ESP32 is plugged in.
+        to_upload = [img] if img else []
+
+        def find():
+            try:
+                return find_port(a.port) if not a.port or os.path.exists(a.port) else None
+            except Fail:
+                return None
+
+        def connect(port):
+            if to_upload:   # upload the program the first time a board shows up
+                ser = upload(to_upload.pop(), port)
+            else:
+                ser = connect_device(port)
+            return ser, _pending.pop(id(ser), b"")
+
+        if not find():
+            log("no ESP32 connected: the screen stays off until you plug one in (or use --sim)")
+        src = screen.DeviceSource(parser, find, connect)
     screen.serve(src, a.http_port, not a.no_open)
     return 0
+
+
+def device_config(settings, port):
+    """Sets key=value pairs stored on the board (or just shows them), e.g. station=8501120."""
+    ser = connect_device(port)
+    _pending.pop(id(ser), None)   # ignore the boot banner (it also prints the config)
+    time.sleep(0.2)
+    ser.reset_input_buffer()
+    for kv in settings or [""]:
+        if kv and "=" not in kv:
+            raise Fail(f"expected key=value, got {kv!r}")
+        data = kv.encode()
+        ser.write(b"\x7fKTC" + struct.pack("<H", len(data)) + data)
+        read_until(ser, b"[ktvm] config", 4)
+        line = read_until(ser, b"\n", 2).decode(errors="replace").strip()
+        if line.startswith("error"):
+            raise Fail("config " + line)
+    print("device config" + line)
+    ser.close()
+
+
+def sim_args(a):
+    return sum((["--config", kv] for kv in (getattr(a, "config", None) or [])), [])
 
 
 # ------------------------------------------------------------------ main
@@ -285,6 +321,7 @@ def main(argv=None):
     p.add_argument("files", nargs="+"); p.add_argument("-o", "--out"); p.add_argument("-v", "--verbose", action="store_true")
     p = sub.add_parser("sim", help="run .kt files (or a .ktv image) in the desktop simulator")
     p.add_argument("files", nargs="+"); p.add_argument("-q", "--quiet", action="store_true", help="hide GPIO trace")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE", help="device setting seen by the program")
     p = sub.add_parser("run", help="compile, upload to the ESP32 and show its output")
     p.add_argument("files", nargs="+"); p.add_argument("--port"); p.add_argument("--no-monitor", action="store_true")
     p = sub.add_parser("screen", help="screen simulator: shows the program's display (and a mock incidents API)")
@@ -292,6 +329,9 @@ def main(argv=None):
     p.add_argument("--sim", action="store_true", help="run in the desktop simulator instead of the ESP32")
     p.add_argument("--port"); p.add_argument("--http-port", type=int, default=8765)
     p.add_argument("--no-open", action="store_true", help="don't open the browser window")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE", help="device setting (simulator only)")
+    p = sub.add_parser("config", help="show or set settings stored on the board (e.g. station=8501120)")
+    p.add_argument("settings", nargs="*", metavar="KEY=VALUE", help="KEY= removes a setting"); p.add_argument("--port")
     p = sub.add_parser("upload", help="upload a .ktv image"); p.add_argument("image"); p.add_argument("--port")
     p = sub.add_parser("monitor", help="show ESP32 serial output"); p.add_argument("--port")
     p = sub.add_parser("flash", help="build & flash the KTVM firmware (once)"); p.add_argument("--port")
@@ -302,7 +342,7 @@ def main(argv=None):
         elif a.cmd == "sim":
             img = a.files[0] if a.files[0].endswith(".ktv") else compile_and_link(a.files)
             build_sim()
-            return subprocess.run([SIM] + (["-q"] if a.quiet else []) + [img]).returncode
+            return subprocess.run([SIM] + (["-q"] if a.quiet else []) + sim_args(a) + [img]).returncode
         elif a.cmd == "run":
             img = compile_and_link(a.files)
             ser = upload(img, a.port)
@@ -310,6 +350,8 @@ def main(argv=None):
                 monitor(ser)
         elif a.cmd == "screen":
             return screen_cmd(a)
+        elif a.cmd == "config":
+            device_config(a.settings, a.port)
         elif a.cmd == "upload":
             upload(a.image, a.port)
         elif a.cmd == "monitor":

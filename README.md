@@ -52,6 +52,7 @@ fun main() {
 ./ktesp build a.kt b.kt -o p.ktv    # only build the image
 ./ktesp upload p.ktv | ./ktesp monitor
 ./ktesp screen examples/trains      # upload + open the TFT emulator (see below)
+./ktesp config station=8501120      # store a setting on the board (see "Device settings")
 ```
 
 A folder can be passed instead of files: all its `.kt` files are compiled, and the one containing `fun main(`
@@ -70,6 +71,21 @@ names the program.
 | `randomInt(n)`, `freeMemory()` | utilities |
 | `Led(pin)`, `Button(pin)`, `loop(periodMs) { }` | helper classes |
 | `Board.name`, `Board.ledPin` | board the program is running on |
+| `Device.id`, `Device.config(key)` | unique hardware id and per-device settings |
+
+### Device settings
+
+Each board can store `key=value` settings in its flash, outside the program, so many boards can run the same
+program image and still know who they are (for example, which station they serve):
+
+```sh
+./ktesp config station=8501120      # set
+./ktesp config station=             # remove
+./ktesp config                      # show: "device config: station=8501120 [id 004B12307914]"
+```
+
+The program reads them with `Device.config("station")`; the board restarts the program when a setting changes.
+In the simulator, pass them with `--config station=8501120` (`./ktesp sim` and `./ktesp screen --sim`).
 
 | Package | API | Description |
 |---|---|---|
@@ -89,19 +105,25 @@ with `external fun` in Kotlin, run `python3 tools/natives.py` (regenerates `nati
 ./ktesp screen                          # just watch the program already running on the ESP32
 ```
 
-`examples/trains/Trains.kt` fetches the current disruptions with a GET to `/api/incidents` and then listens to a
-WebSocket on `/ws/incidents`. The enrichment happens on the board itself: colour by severity, relative times
-("12 min ago"), worst delay, cancelled lines, sorting by severity, paging. The result is drawn as a Swiss-style
+Each board serves one station, whose ID is a device setting (`./ktesp config station=8501120`). The program
+fetches the disruptions with a GET to `/api/incidents?station=ID` (which also returns the station name) and then
+listens to a WebSocket on `/ws/incidents?station=ID`. The enrichment happens on the board itself: it keeps only the
+disruptions affecting its station (each one lists the IDs of the stations it affects), colours them by severity,
+computes relative times ("12 min ago"), the worst delay and cancelled lines, sorts by severity and pages them.
+Without a station ID it shows the whole network. The result is drawn as a Swiss-style
 departure board on a 320x240 TFT: red header with the clock, white background, line pictograms, delays in red.
 
 With `DEMO = true` in `Config.kt` the board needs no network: `Demo.kt` replays built-in sample disruptions
 around Lausanne through the same JSON parsing and enrichment code.
 
 `./ktesp screen` (`tools/screen.py` + `tools/screen_ui.html`) is the Mac app, opened as a Chrome app window:
+- it follows the USB connection: with no ESP32 plugged in the emulated display has no power and stays black;
+  when a board is plugged in it powers up with it (the board boots and its stored program draws the screen),
+  and it goes black again when the board is unplugged;
 - it reads the serial port (or the simulator), separates the display traffic from the console text and shows the
   emulated TFT;
 - it serves a **mock disruptions API** (GET and WebSocket) on port 8765, with buttons to create, update and
-  resolve disruptions.
+  resolve disruptions, and lists the station IDs it knows (UIC-style numbers for stations around Lausanne).
 
 The configuration (WiFi, address of the API, display) lives in `examples/trains/Config.kt`, which is not committed
 to git. Use `Config.kt.example` as a template.

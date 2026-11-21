@@ -521,6 +521,14 @@ int native_call(uint16_t nid, uint32_t* a) {
       return ST_OK;
     case N_esp32_screen_ScreenKt_tftInvert_Z_V: tft_invert(a[0]); tft_flush(); return ST_OK;
     case N_esp32_screen_ScreenKt_tftBacklight_Z_V: tft_backlight(a[0]); tft_flush(); return ST_OK;
+    // ---- device configuration
+    case N_esp32_Esp32Kt_deviceConfig_Ljava_lang_String_Ljava_lang_String: {
+      NEED_STR(a[0], "deviceConfig(key)");
+      char v[128];
+      if (!hal_config_get(str_chars(a[0]), v, sizeof v)) { a[0] = 0; return ST_OK; }
+      return ret_cstr(a, v);
+    }
+    case N_esp32_Esp32Kt_deviceId_Ljava_lang_String: return ret_cstr(a, hal_device_id());
     default: return vm_fatal("native %u not implemented", nid);
   }
 }

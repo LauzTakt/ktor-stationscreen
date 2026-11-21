@@ -1,8 +1,12 @@
 // Train disruption board for a 320x240 TFT, running in Kotlin on the ESP32.
 //
-//   1. GET /api/incidents   -> initial state
-//   2. WS  /ws/incidents    -> live changes (upsert / resolved)
-//   3. enrichment on the board: severity -> colour, relative times, worst delay, sorting by severity
+// Each board serves one station: its station ID is a device setting (`./ktesp config station=8501120`),
+// so every screen runs the same program image.
+//
+//   1. GET /api/incidents?station=ID   -> initial state + station name
+//   2. WS  /ws/incidents?station=ID    -> live changes (upsert / resolved)
+//   3. enrichment on the board: keep only disruptions affecting this station, severity -> colour,
+//      relative times, worst delay, sorting by severity
 //   4. drawing on an ILI9341 TFT: a real one over SPI, or the one emulated on the Mac (./ktesp screen examples/trains)
 package trains
 
@@ -31,12 +35,15 @@ enum class Severity(val label: String, val rank: Int) {
 class Incident(
     val id: String, val line: String, val from: String, val to: String, val station: String,
     val cause: String, val severity: Severity, val delayMin: Int, val since: Long, val message: String,
+    /** IDs of the stations affected by this disruption. */
+    val stations: List<String>,
 )
 
 fun parseIncident(o: JsonObject) = Incident(
     id = o.str("id"), line = o.str("line", "?"), from = o.str("from"), to = o.str("to"),
     station = o.str("station"), cause = o.str("cause"), severity = Severity.of(o.str("severity")),
     delayMin = o.int("delayMin"), since = o.long("since"), message = o.str("message"),
+    stations = o.arr("stations").list.mapNotNull { it as? String },
 )
 
 // ------------------------------------------------------------------ enrichment
@@ -55,7 +62,9 @@ fun clock(epoch: Long): String {
 }
 
 // ------------------------------------------------------------------ state
-class Panel {
+/** State of the board for one station ([stationId] null = show the whole network). */
+class Panel(val stationId: String?) {
+    var stationName: String? = null
     val incidents = LinkedHashMap<String, Incident>()
     val firstSeen = HashMap<String, Int>()        // millis() when an incident appeared / changed (highlight)
     private var clockOffset = 0L                   // server epoch - local seconds
@@ -64,6 +73,11 @@ class Panel {
     var live = false
     var demo = false
     var status = "Connecting"
+
+    /** Enrichment step 1: does this disruption concern our station? */
+    fun affects(inc: Incident) = stationId == null || inc.stations.contains(stationId)
+
+    val title: String get() = stationName ?: if (stationId != null) "Station $stationId" else "Disruptions"
 
     fun now(): Long = clockOffset + millis() / 1000
 
@@ -74,10 +88,11 @@ class Panel {
     fun load(json: String) {
         val o = Json.parseObject(json)
         syncClock(o.long("now"))
+        o.obj("station")?.strOrNull("name")?.let { stationName = it }
         incidents.clear()
         for (it in o.arr("incidents").objects()) {
             val inc = parseIncident(it)
-            incidents[inc.id] = inc
+            if (affects(inc)) incidents[inc.id] = inc
         }
         lastUpdateMs = millis()
         hasData = true
@@ -91,6 +106,10 @@ class Panel {
         when (o.str("type")) {
             "upsert" -> {
                 val inc = parseIncident(o.obj("incident") ?: return false)
+                if (!affects(inc)) {   // not (or no longer) relevant for this station
+                    firstSeen.remove(inc.id)
+                    return incidents.remove(inc.id) != null
+                }
                 val isNew = !incidents.containsKey(inc.id)
                 incidents[inc.id] = inc
                 firstSeen[inc.id] = millis()
@@ -150,7 +169,8 @@ fun render(s: Screen, p: Panel, page: Int) {
 
     // red header: title and clock
     s.fillRect(0, 0, w, HEADER_H, RED)
-    s.text(10, 7, "Disruptions", WHITE, 2, RED)
+    val clockW = if (p.hasData) Screen.textWidth("00:00", 2) + 12 else 0
+    s.text(10, 7, Screen.ellipsize(p.title, w - 20 - clockW, 2), WHITE, 2, RED)
     if (p.hasData) s.textRight(w - 10, 7, clock(p.now()), WHITE, 2, RED)
 
     // summary band
@@ -172,7 +192,8 @@ fun render(s: Screen, p: Panel, page: Int) {
     if (list.isEmpty()) {
         s.fillRect(0, top, w, s.height - top - FOOTER_H, SCREEN_BG)
         s.textCentered(0, w, 96, "No disruptions", CHARCOAL, 2, SCREEN_BG)
-        s.textCentered(0, w, 122, "All lines are running normally", GRANITE, 1, SCREEN_BG)
+        s.textCentered(0, w, 122, if (p.stationId != null) "All trains at this station are running normally"
+            else "All lines are running normally", GRANITE, 1, SCREEN_BG)
     } else {
         val start = pg * ROWS_PER_PAGE
         for (slot in 0 until ROWS_PER_PAGE) {
@@ -187,7 +208,9 @@ fun render(s: Screen, p: Panel, page: Int) {
     val fy = s.height - FOOTER_H
     s.fillRect(0, fy, w, FOOTER_H, SCREEN_BG)
     s.drawLine(0, fy, w, fy, SILVER)
-    if (pages > 1) s.text(10, fy + 5, "Page ${pg + 1} of $pages", METAL, 1, SCREEN_BG)
+    var left = if (p.stationId != null) "ID ${p.stationId}" else "All stations"
+    if (pages > 1) left += " · ${pg + 1}/$pages"
+    s.text(10, fy + 5, left, METAL, 1, SCREEN_BG)
     val source = if (p.demo) "Demo" else if (p.live) "Live" else p.status
     val upd = (millis() - p.lastUpdateMs) / 1000
     val right = if (!p.hasData) source else "$source · ${ago(upd.toLong())}"
@@ -252,7 +275,9 @@ fun splash(s: Screen, line1: String, line2: String) {
 fun main() {
     val screen = createScreen()
     screen.clear(SCREEN_BG)
-    if (DEMO) return runDemo(screen)
+    val station = Device.config("station")
+    println("device ${Device.id}, station ${station ?: "(not set: showing all stations)"}")
+    if (DEMO) return runDemo(screen, station)
     val sim = Board.name == "simulator"
     val host = if (sim) "127.0.0.1" else API_HOST
     val base = "http://$host:$API_PORT"
@@ -266,8 +291,9 @@ fun main() {
         println("WiFi OK, IP ${wifiIp()}")
     }
 
-    val panel = Panel()
-    val ws = WebSocket("ws://$host:$API_PORT/ws/incidents")
+    val query = if (station != null) "?station=$station" else ""
+    val panel = Panel(station)
+    val ws = WebSocket("ws://$host:$API_PORT/ws/incidents$query")
     var page = 0
     var nextPageMs = millis() + 6000
     var nextRenderMs = 0
@@ -280,11 +306,11 @@ fun main() {
             panel.status = "Connecting"
             // WebSocket first, then the snapshot: no event is lost in between
             if (ws.connect(5000)) {
-                val body = Http.getOrNull("$base/api/incidents")
+                val body = Http.getOrNull("$base/api/incidents$query")
                 if (body != null) {
                     panel.load(body)
                     panel.live = true
-                    println("connected: ${panel.incidents.size} disruptions")
+                    println("connected: ${panel.incidents.size} disruptions for ${panel.title}")
                 } else {
                     ws.close()
                 }

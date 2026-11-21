@@ -113,3 +113,6 @@ esp32/screen/ScreenKt.tftFillRoundRect(IIIIII)V
 esp32/screen/ScreenKt.tftText(IILjava/lang/String;III)V
 esp32/screen/ScreenKt.tftInvert(Z)V
 esp32/screen/ScreenKt.tftBacklight(Z)V
+# ---- device identity and configuration (stored on the board, outside the program)
+esp32/Esp32Kt.deviceConfig(Ljava/lang/String;)Ljava/lang/String;
+esp32/Esp32Kt.deviceId()Ljava/lang/String;

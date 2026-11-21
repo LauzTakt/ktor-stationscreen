@@ -109,13 +109,14 @@
         <label class="chk"><input type="checkbox" id="auto" checked> automatic events</label>
       </div>
       <p class="kv" id="api" style="margin-top:10px"></p>
+      <p class="kv" id="stations" style="margin-top:8px"></p>
     </div>
   </section>
 </main>
 <script>
 const GW = 240, GH = 320;
 const gram = new Uint16Array(GW * GH);
-let st = { on: false, sleep: true, bl: 0, inv: false, bgr: false, vscroll: 0, madctl: 0, colmod: 0x66, window: [0,0,0,0] };
+let st = { power: false, on: false, sleep: true, bl: 0, inv: false, bgr: false, vscroll: 0, madctl: 0, colmod: 0x66, window: [0,0,0,0] };
 let Z = 3, mount = 270, dirty = true, updates = 0;
 
 const glass = document.createElement('canvas'); glass.width = GW; glass.height = GH;
@@ -137,7 +138,7 @@ function present() {
   if (!dirty) return;
   dirty = false;
   const d = img.data;
-  const off = !st.on || st.sleep, dark = !st.bl;
+  const off = !st.on || st.sleep, dark = !st.bl || !st.power;
   for (let y = 0; y < GH; y++) {
     const src = ((y + st.vscroll) % GH) * GW;
     for (let x = 0; x < GW; x++) {
@@ -175,6 +176,7 @@ function showState() {
   const w = st.window;
   const cell = (k, v, cls) => `<div>${k}<br><code class="${cls || ''}">${v}</code></div>`;
   document.getElementById('regs').innerHTML =
+    cell('Power', st.power ? 'on (3.3 V)' : 'off: no ESP32', st.power ? 'ok' : 'bad') +
     cell('Sleep', st.sleep ? 'SLPIN (asleep)' : 'SLPOUT', st.sleep ? 'bad' : 'ok') +
     cell('Display', st.on ? 'DISPON' : 'DISPOFF', st.on ? 'ok' : 'bad') +
     cell('Backlight', st.bl ? 'on' : 'off', st.bl ? 'ok' : 'bad') +
@@ -187,12 +189,13 @@ function showState() {
   document.getElementById('spi').innerHTML =
     `Equivalent SPI traffic: <b>${kb.toFixed(1)} KB</b> (${st.cmds} commands, ${st.pixels} pixels) · ` +
     `on a real display at 40 MHz that is ${(st.spiBytes * 8 / 40e6 * 1000).toFixed(0)} ms of bus time`;
-  const pins = [['VCC', 1], ['GND', 0], ['CS', 1], ['RESET', 1], ['DC', 1], ['SDI', 1], ['SCK', 1], ['LED', st.bl], ['SDO', 0]];
+  const pw = st.power ? 1 : 0;
+  const pins = [['VCC', pw], ['GND', 0], ['CS', pw], ['RESET', pw], ['DC', pw], ['SDI', pw], ['SCK', pw], ['LED', pw && st.bl], ['SDO', 0]];
   document.getElementById('pins').innerHTML = pins.map(([n, a]) => `<span class="pin ${a ? 'act' : ''}"><i></i>${n}</span>`).join('');
 }
 
 function setState(s) {
-  const changed = ['on','sleep','bl','inv','bgr','vscroll'].some(k => st[k] !== s[k]);
+  const changed = ['power','on','sleep','bl','inv','bgr','vscroll'].some(k => st[k] !== s[k]);
   st = s; if (changed) dirty = true; showState();
 }
 
@@ -228,6 +231,10 @@ async function info() {
   } catch (e) {}
 }
 setInterval(info, 2000); info();
+fetch('/api/stations').then(r => r.json()).then(list => {
+  document.getElementById('stations').innerHTML = 'Station IDs (<code>./ktesp config station=ID</code>): ' +
+    list.map(st => `${st.name} <code>${st.id}</code>`).join(' · ');
+}).catch(() => {});
 
 const post = u => fetch(u, { method: 'POST' }).then(info);
 document.querySelectorAll('[data-a]').forEach(b => b.onclick = () => post('/api/mock/' + b.dataset.a));

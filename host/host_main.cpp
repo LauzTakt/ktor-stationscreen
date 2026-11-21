@@ -107,6 +107,20 @@ int hal_tcp_read(int h, uint8_t* d, int n, int timeout_ms) {
 }
 void hal_tcp_close(int h) { if (h >= 0) close(h); }
 
+// ---- device configuration: --config key=value (repeatable)
+static const char* g_config[16];
+static int g_nconfig = 0;
+bool hal_config_get(const char* key, char* out, size_t n) {
+  size_t kl = strlen(key);
+  for (int i = 0; i < g_nconfig; i++)
+    if (!strncmp(g_config[i], key, kl) && g_config[i][kl] == '=') {
+      snprintf(out, n, "%s", g_config[i] + kl + 1);
+      return out[0] != 0;
+    }
+  return false;
+}
+const char* hal_device_id() { return "SIMULATOR"; }
+
 int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
   const char* path = nullptr;
@@ -114,9 +128,10 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-q")) g_trace_gpio = false;
     else if (!strcmp(argv[i], "--heap") && i + 1 < argc) heap_kb = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--config") && i + 1 < argc) { if (g_nconfig < 16) g_config[g_nconfig++] = argv[++i]; }
     else path = argv[i];
   }
-  if (!path) { fprintf(stderr, "usage: ktvm-sim [-q] [--heap KB] image.ktv\n"); return 2; }
+  if (!path) { fprintf(stderr, "usage: ktvm-sim [-q] [--heap KB] [--config key=value]... image.ktv\n"); return 2; }
   FILE* f = fopen(path, "rb");
   if (!f) { perror(path); return 2; }
   fseek(f, 0, SEEK_END);

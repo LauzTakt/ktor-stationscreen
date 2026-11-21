@@ -37,6 +37,25 @@ external fun boardName(): String
 /** GPIO of the board's user LED (ESP32 DevKit: 2, Raspberry Pi: 17 by default, configurable on the agent). */
 external fun boardLedPin(): Int
 
+/** A setting stored on the board (set with `./ktesp config key=value`), or null if it is not set. */
+external fun deviceConfig(key: String): String?
+/** Unique hardware id of this board (from its MAC address); "SIMULATOR" in the desktop simulator. */
+external fun deviceId(): String
+
+/**
+ * Per-device settings, kept on the board outside the program, so the same program image can run on many
+ * boards that each know who they are (e.g. which station they serve):
+ *
+ *     ./ktesp config station=8501120        # set
+ *     ./ktesp config station=               # remove
+ *     ./ktesp config                        # show
+ */
+object Device {
+    val id: String get() = deviceId()
+    fun config(key: String): String? = deviceConfig(key)
+    fun config(key: String, default: String): String = deviceConfig(key) ?: default
+}
+
 /** Board information, so one program can run on an ESP32 and on a Raspberry Pi. */
 object Board {
     val name: String get() = boardName()

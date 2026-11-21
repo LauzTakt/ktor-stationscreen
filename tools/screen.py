@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "screen_ui.html")
@@ -73,7 +74,22 @@ class Ili9341:
         self.spi_bytes = 0
         self.stats = {"cmds": 0, "pixels": 0, "resets": 0, "unknown": set()}
         self.backlight = 0
+        self.powered = True
         self.reset_state("power-on")
+
+    def power(self, on):
+        """Supply voltage of the module: it follows the ESP32 being plugged in."""
+        if on == self.powered:
+            return
+        self.powered = on
+        if on:
+            self.gram[:] = os.urandom(GW * GH * 2)   # power-on: undefined memory contents
+            self.backlight = 0
+            self.reset_state("power-on")
+        else:
+            self.backlight = 0
+            self.log("power off")
+            self.touch()
 
     def reset_state(self, why):
         self.madctl = 0x00
@@ -104,7 +120,7 @@ class Ili9341:
             d[0] = min(d[0], box[0]); d[1] = min(d[1], box[1]); d[2] = max(d[2], box[2]); d[3] = max(d[3], box[3])
 
     def state(self):
-        return {"madctl": self.madctl, "colmod": self.colmod, "sleep": self.sleep, "on": self.display_on,
+        return {"power": self.powered, "madctl": self.madctl, "colmod": self.colmod, "sleep": self.sleep, "on": self.display_on,
                 "inv": self.inverted, "bgr": bool(self.madctl & 0x08), "bl": self.backlight, "vscroll": self.vscroll,
                 "window": [self.col[0], self.page[0], self.col[1], self.page[1]], "spiBytes": self.spi_bytes,
                 "cmds": self.stats["cmds"], "pixels": self.stats["pixels"]}
@@ -371,6 +387,10 @@ class Hub:
             self.buslog = self.buslog[-300:]
         self._send("bus", [msg])
 
+    def power(self, on):
+        with self.lock:
+            self.lcd.power(on)
+
     def link_frame(self, payload):
         with self.lock:
             self.link.frame(payload)
@@ -467,8 +487,9 @@ class StreamParser:
 
 # ------------------------------------------------------------------ sources
 class SimSource:
-    def __init__(self, sim, image, parser):
+    def __init__(self, sim, image, parser, extra_args=()):
         self.sim, self.image, self.parser = sim, image, parser
+        self.extra_args = list(extra_args)
         self.proc = None
         self.lock = threading.Lock()
 
@@ -476,7 +497,7 @@ class SimSource:
         with self.lock:
             self.stop_locked()
             self.parser.skip = False
-            self.proc = subprocess.Popen([self.sim, "-q", self.image], stdout=subprocess.PIPE,
+            self.proc = subprocess.Popen([self.sim, "-q"] + self.extra_args + [self.image], stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, bufsize=0)
             threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         self.parser.hub.text(f"[screen] simulator: {os.path.basename(self.image)}\n")
@@ -508,41 +529,92 @@ class SimSource:
     label = property(lambda self: "simulator (Mac)")
 
 
-class SerialSource:
-    def __init__(self, ser, parser, pending=b""):
-        self.ser, self.parser = ser, parser
-        self.pending = pending
+class DeviceSource:
+    """The ESP32 on USB, with hot-plug: while no board is connected the emulated display has no power (black);
+    when one is plugged in it is opened (which boots it), and the display powers up with it."""
+
+    def __init__(self, parser, find, connect):
+        self.parser = parser
+        self.find = find          # () -> port name or None
+        self.connect = connect    # (port) -> (serial, bytes already read)
+        self.ser = None
+        self.port = None
         self.wlock = threading.Lock()
 
     def start(self):
-        if self.pending:  # right after an upload we are in sync: nothing to skip
-            self.parser.skip = False
-            self.parser.feed(self.pending)
-        threading.Thread(target=self._pump, daemon=True).start()
+        self.parser.hub.power(False)
+        threading.Thread(target=self._supervise, daemon=True).start()
 
-    def _pump(self):
+    def _supervise(self):
+        waiting_said = False
+        while True:
+            port = self.find()
+            if not port:
+                if not waiting_said:
+                    self.parser.hub.text("[screen] waiting for an ESP32 on USB...\n")
+                    waiting_said = True
+                time.sleep(0.5)
+                continue
+            waiting_said = False
+            try:
+                time.sleep(0.8)   # let the USB-serial device settle after plugging
+                ser, pending = self.connect(port)
+            except Exception as e:
+                self.parser.hub.text(f"[screen] cannot open {port}: {e}\n")
+                time.sleep(2)
+                continue
+            self.ser, self.port = ser, port
+            self.parser.hub.text(f"[screen] ESP32 connected on {port}\n")
+            self.parser.hub.power(True)
+            self.parser.skip = not pending
+            if pending:
+                self.parser.feed(pending)
+            self._pump(ser)
+            # unplugged
+            self.ser = None
+            self.parser.hub.power(False)
+            self.parser.hub.text(f"\n[screen] ESP32 disconnected from {port}\n")
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _pump(self, ser):
         # The reader only reads: parsing/emulation runs in another thread so the UART never overflows.
         q = queue.Queue()
-        threading.Thread(target=self._parse, args=(q,), daemon=True).start()
+        done = threading.Event()
+
+        def parse():
+            while not (done.is_set() and q.empty()):
+                try:
+                    d = q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                while not q.empty() and len(d) < 65536:
+                    d += q.get()
+                self.parser.feed(d)
+
+        t = threading.Thread(target=parse, daemon=True)
+        t.start()
         while True:
             try:
-                d = self.ser.read(self.ser.in_waiting or 1)
-            except Exception as e:  # unplugged
-                q.put(f"\n[screen] serial port closed: {e}\n".encode())
-                return
+                d = ser.read(ser.in_waiting or 1)
+            except Exception:
+                break
             if d:
                 q.put(d)
-
-    def _parse(self, q):
-        while True:
-            d = q.get()
-            while not q.empty() and len(d) < 65536:
-                d += q.get()
-            self.parser.feed(d)
+            elif not os.path.exists(self.port):
+                break
+        done.set()
+        t.join(2)
 
     def _write(self, b):
         with self.wlock:
-            self.ser.write(b)
+            if self.ser:
+                try:
+                    self.ser.write(b)
+                except Exception:
+                    pass
 
     def stop(self):
         self._write(b"\x7fKTS")
@@ -550,13 +622,19 @@ class SerialSource:
     def restart(self):
         self._write(b"\x7fKTR")
 
-    label = property(lambda self: f"ESP32 ({self.ser.port})")
+    label = property(lambda self: f"ESP32 ({self.port})" if self.ser else "no ESP32 connected: waiting for USB")
 
 
 # ------------------------------------------------------------------ mock train-incidents API
 LINES = ["IC1", "IC5", "IR15", "IR90", "RE33", "S1", "S2", "S3"]
-STATIONS = ["Lausanne", "Genève", "Fribourg", "Bern", "Neuchâtel", "Yverdon-les-Bains", "Morges", "Renens VD",
-            "Vevey", "Montreux", "Palézieux", "Biel/Bienne", "Sion", "Villeneuve"]
+# Station IDs (UIC-style numbers). A board picks its station with `./ktesp config station=<id>`.
+STATION_IDS = {
+    "Lausanne": "8501120", "Genève": "8501008", "Genève-Aéroport": "8501026", "Renens VD": "8501118",
+    "Morges": "8501037", "Yverdon-les-Bains": "8504200", "Fribourg": "8504100", "Bern": "8507000",
+    "Luzern": "8505000", "Neuchâtel": "8504221", "Biel/Bienne": "8504300", "Vevey": "8501200", "Montreux": "8501300",
+}
+STATION_NAMES = {v: k for k, v in STATION_IDS.items()}
+STATIONS = list(STATION_IDS)
 CAUSES = [
     ("Overhead line fault", "high"), ("Defective train", "medium"), ("Planned engineering works", "low"),
     ("Signal box failure", "critical"), ("Emergency services operation", "critical"), ("Points failure", "high"),
@@ -584,11 +662,13 @@ class MockApi:
     def _new(self, since=None):
         cause, sev = random.choice(CAUSES)
         a, b = random.sample(STATIONS, 2)
+        at = random.choice([a, b] + STATIONS[:3])
         line = random.choice(LINES)
         self.next_id += 1
         inc = {
             "id": f"INC-{self.next_id}", "line": line, "from": a, "to": b,
-            "station": random.choice([a, b] + STATIONS[:3]), "cause": cause, "severity": sev,
+            "station": at, "stations": sorted({STATION_IDS[a], STATION_IDS[b], STATION_IDS[at]}),
+            "cause": cause, "severity": sev,
             "delayMin": {"critical": 0, "high": random.choice([15, 20, 30]), "medium": random.choice([5, 10, 15]),
                          "low": random.choice([0, 3, 5])}[sev],
             "since": int(since or time.time()), "updated": int(time.time()),
@@ -597,9 +677,13 @@ class MockApi:
         self.incidents[inc["id"]] = inc
         return inc
 
-    def snapshot(self):
+    def snapshot(self, station=None):
         with self.lock:
-            return {"now": int(time.time()), "incidents": list(self.incidents.values())}
+            incs = [i for i in self.incidents.values() if not station or station in i["stations"]]
+            out = {"now": int(time.time()), "incidents": incs}
+            if station:
+                out["station"] = {"id": station, "name": STATION_NAMES.get(station, f"Station {station}")}
+            return out
 
     def _push(self, msg):
         msg["now"] = int(time.time())
@@ -716,7 +800,10 @@ def make_handler(app):
             elif path == "/events":
                 self._events()
             elif path == "/api/incidents":
-                self._json(app.api.snapshot())
+                q = parse_qs(urlparse(self.path).query)
+                self._json(app.api.snapshot((q.get("station") or [None])[0]))
+            elif path == "/api/stations":
+                self._json([{"id": i, "name": n} for n, i in STATION_IDS.items()])
             elif path == "/api/info":
                 self._json({"source": app.source.label, "lanIp": lan_ip(), "port": app.port,
                             "auto": app.api.auto, "ws": len(app.api.ws_clients), **app.hub.stats})

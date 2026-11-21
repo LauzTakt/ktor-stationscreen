@@ -29,3 +29,7 @@ int hal_tcp_connect(const char* host, int port, bool tls, int timeout_ms);
 int hal_tcp_write(int h, const uint8_t* d, int n);              // bytes written or -1
 int hal_tcp_read(int h, uint8_t* d, int n, int timeout_ms);     // bytes, 0 = timeout, -1 = closed
 void hal_tcp_close(int h);
+
+// ---- device configuration: key=value pairs kept on the board (e.g. station=8501120)
+bool hal_config_get(const char* key, char* out, size_t n);  // false if the key is not set
+const char* hal_device_id();                                // unique hardware id (MAC based)

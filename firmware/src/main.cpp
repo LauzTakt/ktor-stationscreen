@@ -3,6 +3,8 @@
 // Protocol (host -> device):  "\x7fKTV" u32 len  u32 crc32  then len bytes in 512-byte chunks;
 // the device answers "[ktvm] ready" after the header, 0x06 after every chunk, and finally
 // "[ktvm] upload ok (N bytes)". "\x7fKTR" re-runs the stored program, "\x7fKTS" stops it.
+// "\x7fKTC" u16 len "key=value" sets a device setting ("key=" removes it, len 0 just reads them); the device
+// answers "[ktvm] config: k1=v1;k2=v2" and restarts the program so it sees the new value.
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <SPI.h>
@@ -20,6 +22,7 @@
 #define KTVM_BAUD 460800
 #endif
 #define PROG_PATH "/prog.ktv"
+#define CONFIG_PATH "/config.txt"
 #define MAX_IMAGE (160 * 1024)
 #define VM_STACK_BYTES (40 * 1024)
 #ifndef KTVM_MAX_HEAP
@@ -182,6 +185,101 @@ const TftBus* hal_tft_spi_bus(const int pins[TP_COUNT], uint32_t hz) {
   return &SPI_BUS;
 }
 
+// ------------------------------------------------------------------ device configuration
+// Stored in LittleFS as "key=value\n" lines; the in-memory copy is guarded by a mutex (VM task reads it).
+static char g_cfg[1024];
+static SemaphoreHandle_t g_cfg_lock;
+
+static void config_load() {
+  g_cfg[0] = 0;
+  if (!g_fs_ok || !LittleFS.exists(CONFIG_PATH)) return;
+  File f = LittleFS.open(CONFIG_PATH, "r");
+  size_t n = f.read((uint8_t*)g_cfg, sizeof g_cfg - 1);
+  g_cfg[n] = 0;
+  f.close();
+}
+
+static void config_save() {
+  if (!g_fs_ok) return;
+  File f = LittleFS.open(CONFIG_PATH, "w");
+  f.write((const uint8_t*)g_cfg, strlen(g_cfg));
+  f.close();
+}
+
+bool hal_config_get(const char* key, char* out, size_t n) {
+  bool found = false;
+  size_t kl = strlen(key);
+  xSemaphoreTake(g_cfg_lock, portMAX_DELAY);
+  for (const char* l = g_cfg; *l;) {
+    const char* e = strchr(l, '\n');
+    size_t ll = e ? (size_t)(e - l) : strlen(l);
+    if (ll > kl && !strncmp(l, key, kl) && l[kl] == '=') {
+      size_t vl = ll - kl - 1;
+      if (vl >= n) vl = n - 1;
+      memcpy(out, l + kl + 1, vl);
+      out[vl] = 0;
+      found = true;
+      break;
+    }
+    l += ll + (e ? 1 : 0);
+  }
+  xSemaphoreGive(g_cfg_lock);
+  return found;
+}
+
+// Sets (or with an empty value removes) one key.
+static bool config_set(const char* kv) {
+  const char* eq = strchr(kv, '=');
+  if (!eq || eq == kv) return false;
+  size_t kl = eq - kv;
+  char out[sizeof g_cfg];
+  size_t o = 0;
+  xSemaphoreTake(g_cfg_lock, portMAX_DELAY);
+  for (const char* l = g_cfg; *l;) {
+    const char* e = strchr(l, '\n');
+    size_t ll = e ? (size_t)(e - l) : strlen(l);
+    bool same = ll > kl && !strncmp(l, kv, kl) && l[kl] == '=';
+    if (!same && ll && o + ll + 1 < sizeof out) { memcpy(out + o, l, ll); o += ll; out[o++] = '\n'; }
+    l += ll + (e ? 1 : 0);
+  }
+  size_t vl = strlen(eq + 1);
+  bool ok = true;
+  if (vl) {
+    size_t nl = kl + 1 + vl;
+    if (o + nl + 1 < sizeof out) { memcpy(out + o, kv, nl); o += nl; out[o++] = '\n'; }
+    else ok = false;
+  }
+  out[o] = 0;
+  if (ok) memcpy(g_cfg, out, o + 1);
+  xSemaphoreGive(g_cfg_lock);
+  if (ok) config_save();
+  return ok;
+}
+
+static void config_print() {
+  Serial.print("[ktvm] config: ");
+  xSemaphoreTake(g_cfg_lock, portMAX_DELAY);
+  bool first = true;
+  for (const char* p = g_cfg; *p; p++) {
+    if (*p == '\n') { if (p[1]) Serial.print(';'); continue; }
+    Serial.print(*p);
+    first = false;
+  }
+  xSemaphoreGive(g_cfg_lock);
+  if (first) Serial.print("(empty)");
+  Serial.printf(" [id %s]\n", hal_device_id());
+}
+
+const char* hal_device_id() {
+  static char id[16];
+  if (!id[0]) {
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(id, sizeof id, "%02X%02X%02X%02X%02X%02X", (uint8_t)mac, (uint8_t)(mac >> 8), (uint8_t)(mac >> 16),
+             (uint8_t)(mac >> 24), (uint8_t)(mac >> 32), (uint8_t)(mac >> 40));
+  }
+  return id;
+}
+
 // ------------------------------------------------------------------ storage
 static uint8_t* load_program(size_t* len) {
   if (!g_fs_ok || !LittleFS.exists(PROG_PATH)) return nullptr;
@@ -311,14 +409,33 @@ static void receive_upload() {
   g_pending = buf;
 }
 
+static void receive_config() {
+  uint8_t hl[2];
+  if (!read_exact(hl, 2, 1000)) { Serial.println("\n[ktvm] config error: timeout"); return; }
+  size_t n = hl[0] | (hl[1] << 8);
+  if (n >= 200) { Serial.println("\n[ktvm] config error: too long"); return; }
+  char kv[200];
+  if (n && !read_exact((uint8_t*)kv, n, 1000)) { Serial.println("\n[ktvm] config error: timeout"); return; }
+  kv[n] = 0;
+  if (n) {
+    if (!config_set(kv)) { Serial.println("\n[ktvm] config error: expected key=value"); return; }
+    if (g_state == VM_RUNNING) { stop_vm(); g_rerun = true; }  // restart so the program sees the new value
+  }
+  Serial.print("\n");
+  config_print();
+}
+
 // ------------------------------------------------------------------ Arduino entry points
 void setup() {
   Serial.setRxBufferSize(4096);
   Serial.begin(KTVM_BAUD);
   delay(50);
   g_fs_ok = LittleFS.begin(true);
+  g_cfg_lock = xSemaphoreCreateMutex();
+  config_load();
   Serial.printf("\n[ktvm] KTVM ready - Kotlin on ESP32 (free heap %u B, largest block %u B%s)\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)hal_largest_free_block(), g_fs_ok ? "" : ", NO FILESYSTEM");
+  config_print();
   xTaskCreatePinnedToCore(vm_task, "ktvm", VM_STACK_BYTES, nullptr, 1, nullptr, 1);
 }
 
@@ -329,6 +446,7 @@ void loop() {
     if (window == 0x7f4b5456) { window = 0; receive_upload(); }           // \x7f K T V
     else if (window == 0x7f4b5452) { window = 0; stop_vm(); g_rerun = true; }  // \x7f K T R
     else if (window == 0x7f4b5453) { window = 0; stop_vm(); }              // \x7f K T S
+    else if (window == 0x7f4b5443) { window = 0; receive_config(); }       // \x7f K T C
   }
   delay(5);
 }
