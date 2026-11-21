@@ -1,0 +1,115 @@
+# Natives implemented in C by the KTVM firmware / agent.
+# One JVM method key per line; the line order (ignoring comments) is the native id.
+# APPEND ONLY: changing the order breaks images built for older firmware.
+# ---- java.lang.Object
+java/lang/Object.<init>()V
+java/lang/Object.toString()Ljava/lang/String;
+java/lang/Object.hashCode()I
+java/lang/Object.equals(Ljava/lang/Object;)Z
+[.clone()Ljava/lang/Object;
+java/lang/Object.clone()Ljava/lang/Object;
+# ---- java.lang.String (immutable byte strings, UTF-8)
+java/lang/String.length()I
+java/lang/String.charAt(I)C
+java/lang/String.isEmpty()Z
+java/lang/String.equals(Ljava/lang/Object;)Z
+java/lang/String.hashCode()I
+java/lang/String.toString()Ljava/lang/String;
+java/lang/String.compareTo(Ljava/lang/String;)I
+java/lang/String.compareTo(Ljava/lang/Object;)I
+java/lang/String.substring(I)Ljava/lang/String;
+java/lang/String.substring(II)Ljava/lang/String;
+java/lang/String.subSequence(II)Ljava/lang/CharSequence;
+java/lang/String.indexOf(I)I
+java/lang/String.indexOf(II)I
+java/lang/String.indexOf(Ljava/lang/String;)I
+java/lang/String.indexOf(Ljava/lang/String;I)I
+java/lang/String.lastIndexOf(I)I
+java/lang/String.lastIndexOf(Ljava/lang/String;)I
+java/lang/String.contains(Ljava/lang/CharSequence;)Z
+java/lang/String.startsWith(Ljava/lang/String;)Z
+java/lang/String.endsWith(Ljava/lang/String;)Z
+java/lang/String.toUpperCase()Ljava/lang/String;
+java/lang/String.toLowerCase()Ljava/lang/String;
+java/lang/String.toUpperCase(Ljava/util/Locale;)Ljava/lang/String;
+java/lang/String.toLowerCase(Ljava/util/Locale;)Ljava/lang/String;
+java/lang/String.trim()Ljava/lang/String;
+java/lang/String.concat(Ljava/lang/String;)Ljava/lang/String;
+java/lang/String.replace(CC)Ljava/lang/String;
+java/lang/String.equalsIgnoreCase(Ljava/lang/String;)Z
+java/lang/String.toCharArray()[C
+java/lang/String.intern()Ljava/lang/String;
+java/lang/String.valueOf(I)Ljava/lang/String;
+java/lang/String.valueOf(J)Ljava/lang/String;
+java/lang/String.valueOf(C)Ljava/lang/String;
+java/lang/String.valueOf(Z)Ljava/lang/String;
+java/lang/String.valueOf(F)Ljava/lang/String;
+java/lang/String.valueOf(D)Ljava/lang/String;
+java/lang/String.valueOf([C)Ljava/lang/String;
+# ---- ktvm.Native: helpers used by the Java shim library
+ktvm/Native.print(Ljava/lang/String;)V
+ktvm/Native.intToString(I)Ljava/lang/String;
+ktvm/Native.longToString(J)Ljava/lang/String;
+ktvm/Native.floatToString(F)Ljava/lang/String;
+ktvm/Native.doubleToString(D)Ljava/lang/String;
+ktvm/Native.charToString(C)Ljava/lang/String;
+ktvm/Native.className(Ljava/lang/Object;)Ljava/lang/String;
+ktvm/Native.identityHash(Ljava/lang/Object;)I
+ktvm/Native.raise(Ljava/lang/Object;)V
+ktvm/Native.strToBytes(Ljava/lang/String;[BI)V
+ktvm/Native.bytesToString([BII)Ljava/lang/String;
+ktvm/Native.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V
+ktvm/Native.millis()J
+ktvm/Native.nanos()J
+ktvm/Native.sleep(J)V
+ktvm/Native.floatToIntBits(F)I
+ktvm/Native.intBitsToFloat(I)F
+ktvm/Native.doubleToLongBits(D)J
+ktvm/Native.longBitsToDouble(J)D
+ktvm/Native.parseDouble(Ljava/lang/String;)D
+ktvm/Native.mathD(ID)D
+ktvm/Native.mathD2(IDD)D
+ktvm/Native.formatDouble(DI)Ljava/lang/String;
+ktvm/Native.randomInt()I
+ktvm/Native.freeMemory()I
+ktvm/Native.gc()V
+# ---- esp32 hardware API (runtime/kotlin/esp32/Esp32.kt)
+esp32/Esp32Kt.pinMode(II)V
+esp32/Esp32Kt.digitalWrite(II)V
+esp32/Esp32Kt.digitalRead(I)I
+esp32/Esp32Kt.analogRead(I)I
+esp32/Esp32Kt.analogWrite(II)V
+esp32/Esp32Kt.touchRead(I)I
+esp32/Esp32Kt.delay(I)V
+esp32/Esp32Kt.millis()I
+esp32/Esp32Kt.micros()I
+esp32/Esp32Kt.randomInt(I)I
+esp32/Esp32Kt.freeMemory()I
+esp32/Esp32Kt.chipTemperature()F
+esp32/Esp32Kt.tone(III)V
+# ---- board info (interoperable programs)
+esp32/Esp32Kt.boardName()Ljava/lang/String;
+esp32/Esp32Kt.boardLedPin()I
+# ---- network (esp32.net): WiFi, HTTP GET, WebSocket client
+esp32/net/NetKt.wifiConnect(Ljava/lang/String;Ljava/lang/String;I)Z
+esp32/net/NetKt.wifiIp()Ljava/lang/String;
+esp32/net/NetKt.httpGet(Ljava/lang/String;I)Ljava/lang/String;
+esp32/net/NetKt.httpStatus()I
+esp32/net/NetKt.wsOpen(Ljava/lang/String;I)I
+esp32/net/NetKt.wsPoll(II)Ljava/lang/String;
+esp32/net/NetKt.wsSend(ILjava/lang/String;)Z
+esp32/net/NetKt.wsConnected(I)Z
+esp32/net/NetKt.wsClose(I)V
+# ---- TFT display (esp32.screen): ILI9341 over SPI or over the USB link to the emulator
+esp32/screen/ScreenKt.tftBegin(IIIIIIIIII)Z
+esp32/screen/ScreenKt.tftWidth()I
+esp32/screen/ScreenKt.tftHeight()I
+esp32/screen/ScreenKt.tftFillRect(IIIII)V
+esp32/screen/ScreenKt.tftDrawPixel(III)V
+esp32/screen/ScreenKt.tftDrawLine(IIIII)V
+esp32/screen/ScreenKt.tftDrawRect(IIIII)V
+esp32/screen/ScreenKt.tftFillCircle(IIII)V
+esp32/screen/ScreenKt.tftFillRoundRect(IIIIII)V
+esp32/screen/ScreenKt.tftText(IILjava/lang/String;III)V
+esp32/screen/ScreenKt.tftInvert(Z)V
+esp32/screen/ScreenKt.tftBacklight(Z)V

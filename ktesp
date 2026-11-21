@@ -1,0 +1,6 @@
+#!/bin/sh
+# Wrapper: runs the ktesp CLI with the project's Python venv (has pyserial).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="$DIR/.venv/bin/python3"
+[ -x "$PY" ] || PY=python3
+exec "$PY" "$DIR/tools/ktesp.py" "$@"
