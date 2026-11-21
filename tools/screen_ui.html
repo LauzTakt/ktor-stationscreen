@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KTVM Screen</title>
+<style>
+  :root {
+    --bg: #f3f4f6; --panel: #ffffff; --text: #1f2328; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #7f52ff; --ok: #16a34a; --bad: #dc2626; --console-bg: #0f1115; --console-fg: #d1d5db;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111318; --panel: #1a1d24; --text: #e6e7ea; --muted: #9096a1; --line: #2a2e37; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-bottom: 1px solid var(--line);
+           background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .src { color: var(--muted); font-size: 13px; }
+  header .sp { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  main { display: flex; flex-wrap: wrap; gap: 18px; padding: 18px; align-items: flex-start; }
+  main > section:first-child { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+  main > section.stack { flex: 1 1 360px; min-width: 0; }
+  .module { background: #1d4f91; border-radius: 6px; padding: 14px 16px 12px; display: inline-block; max-width: 100%;
+            box-shadow: 0 10px 30px rgba(0,0,0,.25); position: relative; }
+  .module .bezel { background: #0b0c0e; padding: 10px; border-radius: 3px; }
+  .module canvas { display: block; max-width: 100%; height: auto; image-rendering: pixelated; }
+  .module .silk { color: #dfe7f3; font: 10px/1 ui-monospace, Menlo, monospace; opacity: .85; margin-top: 8px;
+                  display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .pins { display: flex; gap: 5px; margin-bottom: 8px; flex-wrap: wrap; }
+  .pin { font: 9px/1 ui-monospace, Menlo, monospace; color: #dfe7f3; text-align: center; }
+  .pin i { display: block; width: 9px; height: 9px; border-radius: 50%; background: #c9a227; margin: 0 auto 3px;
+           border: 1px solid #8a6d10; }
+  .pin.act i { background: #ffe066; box-shadow: 0 0 6px #ffe066; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .stack { display: grid; gap: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select { font: inherit; font-size: 13px; padding: 6px 11px; border-radius: 7px; border: 1px solid var(--line);
+                   background: var(--panel); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  pre.log { background: var(--console-bg); color: var(--console-fg); font: 12px/1.45 ui-monospace, Menlo, monospace;
+            height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; padding: 10px; border-radius: 8px; margin: 0; }
+  .kv { color: var(--muted); font-size: 12.5px; margin: 0; }
+  .kv code, .regs code { color: var(--text); font-size: 12px; word-break: break-all; }
+  .regs { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 14px; font-size: 12.5px; }
+  .regs div { color: var(--muted); }
+  .ok { color: var(--ok) !important; } .bad { color: var(--bad) !important; }
+  label.chk { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>KTVM Screen · ILI9341</h1>
+  <span class="src"><span id="dot" class="dot"></span><span id="src">connecting…</span></span>
+  <span class="sp"></span>
+  <button id="restart" title="Run the program again">Restart program</button>
+  <button id="stop">Stop</button>
+</header>
+<main>
+  <section>
+    <div class="module">
+      <div class="pins" id="pins"></div>
+      <div class="bezel"><canvas id="lcd" width="320" height="240"></canvas></div>
+      <div class="silk"><span>2.8" TFT SPI 240x320 · ILI9341 (emulated)</span><span id="fps"></span></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label class="chk">Zoom
+        <select id="zoom"><option>1</option><option>2</option><option selected>3</option><option>4</option></select>
+      </label>
+      <label class="chk">Panel mounting
+        <select id="mount">
+          <option value="0">portrait (rotation 0)</option>
+          <option value="270" selected>landscape (rotation 1)</option>
+          <option value="180">portrait, flipped (rotation 2)</option>
+          <option value="90">landscape, flipped (rotation 3)</option>
+        </select>
+      </label>
+      <button id="shot">Save PNG</button>
+    </div>
+  </section>
+  <section class="stack">
+    <div class="panel">
+      <h2>ILI9341 controller (registers)</h2>
+      <div class="regs" id="regs"></div>
+      <p class="kv" id="spi" style="margin-top:10px"></p>
+    </div>
+    <div class="panel">
+      <h2>Serial console</h2>
+      <pre class="log" id="console"></pre>
+      <div class="row" style="margin-top:8px"><button id="clr">Clear</button></div>
+    </div>
+    <div class="panel">
+      <h2>SPI bus (decoded commands)</h2>
+      <pre class="log" id="bus" style="height:140px"></pre>
+    </div>
+    <div class="panel">
+      <h2>Disruptions API (mock)</h2>
+      <div class="row">
+        <button class="primary" data-a="new">+ New disruption</button>
+        <button data-a="update">Update one</button>
+        <button data-a="resolve">Resolve one</button>
+        <button data-a="clear">Resolve all</button>
+        <label class="chk"><input type="checkbox" id="auto" checked> automatic events</label>
+      </div>
+      <p class="kv" id="api" style="margin-top:10px"></p>
+    </div>
+  </section>
+</main>
+<script>
+const GW = 240, GH = 320;
+const gram = new Uint16Array(GW * GH);
+let st = { on: false, sleep: true, bl: 0, inv: false, bgr: false, vscroll: 0, madctl: 0, colmod: 0x66, window: [0,0,0,0] };
+let Z = 3, mount = 270, dirty = true, updates = 0;
+
+const glass = document.createElement('canvas'); glass.width = GW; glass.height = GH;
+const gctx = glass.getContext('2d');
+const img = gctx.createImageData(GW, GH);
+const lcd = document.getElementById('lcd'), ctx = lcd.getContext('2d');
+
+function b64(s) { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+function putRegion(x, y, w, h, bytes) {
+  for (let r = 0; r < h; r++) {
+    let o = (y + r) * GW + x, k = r * w * 2;
+    for (let c = 0; c < w; c++, k += 2) gram[o + c] = bytes[k] << 8 | bytes[k + 1];
+  }
+  dirty = true;
+}
+
+// What the glass shows, given the controller state (datasheet behaviour of a BGR, normally-white TN panel).
+function present() {
+  if (!dirty) return;
+  dirty = false;
+  const d = img.data;
+  const off = !st.on || st.sleep, dark = !st.bl;
+  for (let y = 0; y < GH; y++) {
+    const src = ((y + st.vscroll) % GH) * GW;
+    for (let x = 0; x < GW; x++) {
+      const i = (y * GW + x) * 4;
+      let r, g, b;
+      if (dark) { r = g = b = 6; }
+      else if (off) { r = g = b = 236; }
+      else {
+        const v = gram[src + x];
+        r = (v >> 11) * 255 / 31; g = ((v >> 5) & 63) * 255 / 63; b = (v & 31) * 255 / 31;
+        if (!st.bgr) { const t = r; r = b; b = t; }      // panel is BGR: without MADCTL.BGR red and blue swap
+        if (st.inv) { r = 255 - r; g = 255 - g; b = 255 - b; }
+      }
+      d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = 255;
+    }
+  }
+  gctx.putImageData(img, 0, 0);
+  const land = mount === 90 || mount === 270;
+  const vw = land ? GH : GW, vh = land ? GW : GH;
+  if (lcd.width !== vw * Z || lcd.height !== vh * Z) { lcd.width = vw * Z; lcd.height = vh * Z; }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.scale(Z, Z);
+  if (mount === 90) { ctx.translate(GH, 0); ctx.rotate(Math.PI / 2); }
+  else if (mount === 180) { ctx.translate(GW, GH); ctx.rotate(Math.PI); }
+  else if (mount === 270) { ctx.translate(0, GW); ctx.rotate(-Math.PI / 2); }
+  ctx.drawImage(glass, 0, 0);
+}
+(function loop() { present(); requestAnimationFrame(loop); })();
+
+const hex = v => v.toString(16).toUpperCase().padStart(2, '0');
+function showState() {
+  const m = st.madctl, bits = [m & 0x80 && 'MY', m & 0x40 && 'MX', m & 0x20 && 'MV', m & 0x08 && 'BGR'].filter(Boolean).join(' ') || '—';
+  const bpp = (st.colmod & 7) === 5 ? '16 bit (RGB565)' : (st.colmod & 7) === 6 ? '18 bit (RGB666)' : '?';
+  const w = st.window;
+  const cell = (k, v, cls) => `<div>${k}<br><code class="${cls || ''}">${v}</code></div>`;
+  document.getElementById('regs').innerHTML =
+    cell('Sleep', st.sleep ? 'SLPIN (asleep)' : 'SLPOUT', st.sleep ? 'bad' : 'ok') +
+    cell('Display', st.on ? 'DISPON' : 'DISPOFF', st.on ? 'ok' : 'bad') +
+    cell('Backlight', st.bl ? 'on' : 'off', st.bl ? 'ok' : 'bad') +
+    cell('MADCTL (36h)', `${hex(m)} · ${bits}`) +
+    cell('COLMOD (3Ah)', `${hex(st.colmod)} · ${bpp}`, (st.colmod & 7) === 5 ? '' : 'bad') +
+    cell('Inversion', st.inv ? 'INVON' : 'INVOFF') +
+    cell('Window CASET/PASET', `x ${w[0]}–${w[2]} · y ${w[1]}–${w[3]}`) +
+    cell('Scroll (37h)', st.vscroll);
+  const kb = st.spiBytes / 1024;
+  document.getElementById('spi').innerHTML =
+    `Equivalent SPI traffic: <b>${kb.toFixed(1)} KB</b> (${st.cmds} commands, ${st.pixels} pixels) · ` +
+    `on a real display at 40 MHz that is ${(st.spiBytes * 8 / 40e6 * 1000).toFixed(0)} ms of bus time`;
+  const pins = [['VCC', 1], ['GND', 0], ['CS', 1], ['RESET', 1], ['DC', 1], ['SDI', 1], ['SCK', 1], ['LED', st.bl], ['SDO', 0]];
+  document.getElementById('pins').innerHTML = pins.map(([n, a]) => `<span class="pin ${a ? 'act' : ''}"><i></i>${n}</span>`).join('');
+}
+
+function setState(s) {
+  const changed = ['on','sleep','bl','inv','bgr','vscroll'].some(k => st[k] !== s[k]);
+  st = s; if (changed) dirty = true; showState();
+}
+
+function print(el, text) {
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.textContent += text;
+  if (el.textContent.length > 60000) el.textContent = el.textContent.slice(-45000);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+const con = document.getElementById('console'), bus = document.getElementById('bus');
+
+const es = new EventSource('/events');
+es.onopen = () => document.getElementById('dot').classList.add('on');
+es.onerror = () => document.getElementById('dot').classList.remove('on');
+es.addEventListener('full', e => { const d = JSON.parse(e.data); putRegion(0, 0, GW, GH, b64(d.data)); setState(d.state); });
+es.addEventListener('gram', e => {
+  const d = JSON.parse(e.data); putRegion(d.x, d.y, d.w, d.h, b64(d.data)); setState(d.state);
+  document.getElementById('fps').textContent = `${++updates} updates`;
+});
+es.addEventListener('state', e => setState(JSON.parse(e.data)));
+es.addEventListener('console', e => print(con, JSON.parse(e.data)));
+es.addEventListener('bus', e => print(bus, JSON.parse(e.data).map(l => l + '\n').join('')));
+
+async function info() {
+  try {
+    const r = await (await fetch('/api/info')).json();
+    document.getElementById('src').textContent = r.source;
+    document.getElementById('auto').checked = r.auto;
+    document.getElementById('api').innerHTML =
+      `From the ESP32: <code>http://${r.lanIp}:${r.port}/api/incidents</code> · ` +
+      `<code>ws://${r.lanIp}:${r.port}/ws/incidents</code> · WS clients: <b>${r.ws}</b> · ` +
+      `link frames: ${r.frames}${r.badFrames ? ` (<span class="bad">${r.badFrames} corrupted</span>)` : ''}`;
+  } catch (e) {}
+}
+setInterval(info, 2000); info();
+
+const post = u => fetch(u, { method: 'POST' }).then(info);
+document.querySelectorAll('[data-a]').forEach(b => b.onclick = () => post('/api/mock/' + b.dataset.a));
+document.getElementById('auto').onchange = e => post('/api/mock/' + (e.target.checked ? 'auto-on' : 'auto-off'));
+document.getElementById('restart').onclick = () => post('/api/device/restart');
+document.getElementById('stop').onclick = () => post('/api/device/stop');
+document.getElementById('clr').onclick = () => con.textContent = '';
+const save = (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} };
+const load = k => { try { return localStorage.getItem(k); } catch (_) { return null; } };
+document.getElementById('zoom').onchange = e => { Z = +e.target.value; save('zoom', Z); dirty = true; };
+document.getElementById('mount').onchange = e => { mount = +e.target.value; save('mount', mount); dirty = true; };
+if (load('zoom')) { Z = +load('zoom'); document.getElementById('zoom').value = Z; }
+if (load('mount')) { mount = +load('mount'); document.getElementById('mount').value = mount; }
+document.getElementById('shot').onclick = () => {
+  const a = document.createElement('a'); a.download = 'screen.png'; a.href = lcd.toDataURL('image/png'); a.click();
+};
+showState();
+</script>
+</body>
+</html>

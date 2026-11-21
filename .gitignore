@@ -1,0 +1,11 @@
+build/
+.venv/
+.pio-venv/
+firmware/.pio/
+.ca-bundle.pem
+.install_*.log
+*.ktv
+__pycache__/
+*.pyc
+.DS_Store
+examples/trains/Config.kt
