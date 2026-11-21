@@ -33,3 +33,7 @@ void hal_tcp_close(int h);
 // ---- device configuration: key=value pairs kept on the board (e.g. station=8501120)
 bool hal_config_get(const char* key, char* out, size_t n);  // false if the key is not set
 const char* hal_device_id();                                // unique hardware id (MAC based)
+
+// ---- wall clock
+bool hal_ntp_sync(const char* server, int timeout_ms);  // sets the system clock from an NTP server
+int64_t hal_epoch_ms();                                  // UTC epoch ms, 0 if the clock was never set

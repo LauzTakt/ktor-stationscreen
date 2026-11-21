@@ -121,6 +121,17 @@ bool hal_config_get(const char* key, char* out, size_t n) {
 }
 const char* hal_device_id() { return "SIMULATOR"; }
 
+// ---- wall clock: the computer's clock is already synchronised
+bool hal_ntp_sync(const char* server, int) {
+  fprintf(stderr, "[sim] ntpSync(\"%s\") -> using the computer's clock\n", server);
+  return true;
+}
+int64_t hal_epoch_ms() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
   const char* path = nullptr;

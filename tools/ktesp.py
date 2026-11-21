@@ -265,7 +265,10 @@ def screen_cmd(a):
         if not img:
             raise Fail("--sim needs a program (.kt files, folder or .ktv)")
         build_sim()
-        src = screen.SimSource(SIM, img, parser, sim_args(a))
+        extra = sim_args(a)
+        if not any(kv.startswith("api=") for kv in (a.config or [])):
+            extra += ["--config", f"api=http://127.0.0.1:{a.http_port}"]   # the mock API served by this app
+        src = screen.SimSource(SIM, img, parser, extra)
     else:
         # Real board, with hot-plug: the window shows a black (unpowered) display until an ESP32 is plugged in.
         to_upload = [img] if img else []

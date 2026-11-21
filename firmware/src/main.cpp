@@ -11,6 +11,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include <esp_partition.h>
 #include <esp_timer.h>
 
 #include "hal.h"
@@ -23,7 +24,7 @@
 #endif
 #define PROG_PATH "/prog.ktv"
 #define CONFIG_PATH "/config.txt"
-#define MAX_IMAGE (160 * 1024)
+#define MAX_IMAGE (512 * 1024)
 #define VM_STACK_BYTES (40 * 1024)
 #ifndef KTVM_MAX_HEAP
 #define KTVM_MAX_HEAP (80 * 1024)
@@ -31,8 +32,7 @@
 
 enum { VM_IDLE, VM_RUNNING };
 static volatile int g_state = VM_IDLE;
-static uint8_t* volatile g_pending = nullptr;
-static volatile size_t g_pending_len = 0;
+static volatile bool g_new_program = false;  // an upload was stored: run it
 static volatile bool g_rerun = false;
 static bool g_fs_ok = false;
 
@@ -132,6 +132,25 @@ void hal_tcp_close(int h) {
   g_sock[h]->stop();
   delete g_sock[h];
   g_sock[h] = nullptr;
+}
+
+// ------------------------------------------------------------------ wall clock (SNTP)
+bool hal_ntp_sync(const char* server, int timeout_ms) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  configTime(0, 0, server, "pool.ntp.org");   // UTC; local time is computed by the program
+  uint32_t t0 = millis();
+  while (time(nullptr) < 1600000000) {
+    if (vm_abort_flag || (int)(millis() - t0) > timeout_ms) return false;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return true;
+}
+
+int64_t hal_epoch_ms() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec < 1600000000) return 0;
+  return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 // ------------------------------------------------------------------ TFT over SPI (real ILI9341 module)
@@ -281,28 +300,92 @@ const char* hal_device_id() {
 }
 
 // ------------------------------------------------------------------ storage
-static uint8_t* load_program(size_t* len) {
-  if (!g_fs_ok || !LittleFS.exists(PROG_PATH)) return nullptr;
-  File f = LittleFS.open(PROG_PATH, "r");
-  if (!f) return nullptr;
-  size_t n = f.size();
-  uint8_t* b = (uint8_t*)malloc(n);
-  if (b && f.read(b, n) != n) { free(b); b = nullptr; }
-  f.close();
-  *len = n;
-  return b;
+// The program image lives in the second app partition (app1/ota_1, unused: no OTA) and is executed straight from
+// flash through the MMU, so it takes no RAM: the Kotlin heap and the WiFi stack get it instead.
+// Layout: "KTVP" u32 len u32 crc32, then the image. The header is written last, so a broken upload is never valid.
+#define PROG_HDR 12
+
+static uint32_t crc32_update(uint32_t c, const uint8_t* p, size_t n) {
+  c = ~c;
+  while (n--) {
+    c ^= *p++;
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1)));
+  }
+  return ~c;
 }
 
-static void save_program(const uint8_t* b, size_t n) {
-  if (!g_fs_ok) return;
-  File f = LittleFS.open(PROG_PATH, "w");
-  if (!f) return;
-  f.write(b, n);
+static const esp_partition_t* prog_partition() {
+  static const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
+  return p;
+}
+
+static bool prog_header(uint32_t* len, uint32_t* crc) {
+  const esp_partition_t* p = prog_partition();
+  uint8_t h[PROG_HDR];
+  if (!p || esp_partition_read(p, 0, h, PROG_HDR) != ESP_OK || memcmp(h, "KTVP", 4)) return false;
+  memcpy(len, h + 4, 4);
+  memcpy(crc, h + 8, 4);
+  return *len > 0 && *len <= MAX_IMAGE && *len + PROG_HDR <= p->size;
+}
+
+static bool prog_begin(size_t len) {  // erase room for a new image
+  const esp_partition_t* p = prog_partition();
+  if (!p || len + PROG_HDR > p->size) return false;
+  size_t span = (len + PROG_HDR + 4095) & ~(size_t)4095;
+  return esp_partition_erase_range(p, 0, span) == ESP_OK;
+}
+
+static bool prog_write(size_t off, const uint8_t* d, size_t n) {
+  return esp_partition_write(prog_partition(), PROG_HDR + off, d, n) == ESP_OK;
+}
+
+static bool prog_commit(uint32_t len, uint32_t crc) {
+  uint8_t h[PROG_HDR] = {'K', 'T', 'V', 'P'};
+  memcpy(h + 4, &len, 4);
+  memcpy(h + 8, &crc, 4);
+  return esp_partition_write(prog_partition(), 0, h, PROG_HDR) == ESP_OK;
+}
+
+// Maps the stored image into the address space; returns nullptr if there is none.
+static const uint8_t* prog_map(size_t* len, spi_flash_mmap_handle_t* handle) {
+  uint32_t n, crc;
+  if (!prog_header(&n, &crc)) return nullptr;
+  const void* ptr = nullptr;
+  if (esp_partition_mmap(prog_partition(), 0, n + PROG_HDR, SPI_FLASH_MMAP_DATA, &ptr, handle) != ESP_OK) return nullptr;
+  const uint8_t* img = (const uint8_t*)ptr + PROG_HDR;
+  if (crc32_update(0, img, n) != crc) {
+    spi_flash_munmap(*handle);
+    Serial.println("[ktvm] stored program is corrupted");
+    return nullptr;
+  }
+  *len = n;
+  return img;
+}
+
+// Older firmware kept the program in LittleFS: move it to the partition once.
+static void migrate_program() {
+  uint32_t n, crc;
+  if (prog_header(&n, &crc) || !g_fs_ok || !LittleFS.exists(PROG_PATH)) return;
+  File f = LittleFS.open(PROG_PATH, "r");
+  size_t len = f.size();
+  if (len && len <= MAX_IMAGE && prog_begin(len)) {
+    uint8_t buf[1024];
+    uint32_t c = 0;
+    size_t off = 0;
+    while (off < len) {
+      size_t k = f.read(buf, sizeof buf);
+      if (!k || !prog_write(off, buf, k)) break;
+      c = crc32_update(c, buf, k);
+      off += k;
+    }
+    if (off == len) prog_commit(len, c);
+  }
   f.close();
+  LittleFS.remove(PROG_PATH);
 }
 
 // ------------------------------------------------------------------ VM task
-static void run_image(uint8_t* img, size_t len) {
+static void run_image(const uint8_t* img, size_t len) {
   char err[96];
   vm_abort_flag = false;
   g_state = VM_RUNNING;
@@ -324,28 +407,24 @@ static void run_image(uint8_t* img, size_t len) {
   g_state = VM_IDLE;
 }
 
-static void vm_task(void*) {
+static bool run_stored() {
   size_t len = 0;
-  uint8_t* img = load_program(&len);
-  if (img) {
-    Serial.println("[ktvm] starting stored program");
-    run_image(img, len);
-    free(img);
-  } else {
-    Serial.println("[ktvm] no program stored yet: run `./ktesp run examples/Blink.kt`");
-  }
+  spi_flash_mmap_handle_t h;
+  const uint8_t* img = prog_map(&len, &h);
+  if (!img) return false;
+  run_image(img, len);
+  spi_flash_munmap(h);
+  return true;
+}
+
+static void vm_task(void*) {
+  migrate_program();
+  Serial.println("[ktvm] starting stored program");
+  if (!run_stored()) Serial.println("[ktvm] no program stored yet: run `./ktesp run examples/Blink.kt`");
   for (;;) {
-    if (g_pending) {
-      img = g_pending;
-      len = g_pending_len;
-      g_pending = nullptr;
-      save_program(img, len);
-      run_image(img, len);
-      free(img);
-    } else if (g_rerun) {
-      g_rerun = false;
-      img = load_program(&len);
-      if (img) { run_image(img, len); free(img); }
+    if (g_new_program || g_rerun) {
+      g_new_program = g_rerun = false;
+      run_stored();
     } else {
       vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -353,15 +432,6 @@ static void vm_task(void*) {
 }
 
 // ------------------------------------------------------------------ upload protocol
-static uint32_t crc32(const uint8_t* p, size_t n) {
-  uint32_t c = 0xFFFFFFFFu;
-  while (n--) {
-    c ^= *p++;
-    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1)));
-  }
-  return ~c;
-}
-
 static bool read_exact(uint8_t* d, size_t n, uint32_t timeout_ms) {
   size_t got = 0;
   uint32_t last = millis();
@@ -393,20 +463,23 @@ static void receive_upload() {
   if (len == 0 || len > MAX_IMAGE) { Serial.printf("\n[ktvm] upload error: bad size %u\n", (unsigned)len); return; }
   stop_vm();
   if (g_state == VM_RUNNING) { Serial.println("\n[ktvm] upload error: program did not stop"); return; }
-  if (g_pending) { free(g_pending); g_pending = nullptr; }
-  uint8_t* buf = (uint8_t*)malloc(len);
-  if (!buf) { Serial.printf("\n[ktvm] upload error: no memory for %u bytes\n", (unsigned)len); return; }
+  // The image is streamed into the program partition (no RAM buffer); the VM is stopped, so nothing maps it now.
+  if (!prog_begin(len)) { Serial.println("\n[ktvm] upload error: cannot erase the program partition"); return; }
   Serial.print("\n[ktvm] ready\n");
+  uint8_t buf[512];
+  uint32_t c = 0;
   for (size_t got = 0; got < len;) {
     size_t n = len - got < 512 ? len - got : 512;
-    if (!read_exact(buf + got, n, 3000)) { free(buf); Serial.println("\n[ktvm] upload error: timeout"); return; }
+    if (!read_exact(buf, n, 3000)) { Serial.println("\n[ktvm] upload error: timeout"); return; }
+    if (!prog_write(got, buf, n)) { Serial.println("\n[ktvm] upload error: flash write failed"); return; }
+    c = crc32_update(c, buf, n);
     got += n;
     Serial.write((uint8_t)0x06);
   }
-  if (crc32(buf, len) != crc) { free(buf); Serial.println("\n[ktvm] upload error: bad checksum"); return; }
+  if (c != crc) { Serial.println("\n[ktvm] upload error: bad checksum"); return; }
+  if (!prog_commit(len, crc)) { Serial.println("\n[ktvm] upload error: flash write failed"); return; }
   Serial.printf("\n[ktvm] upload ok (%u bytes)\n", (unsigned)len);
-  g_pending_len = len;
-  g_pending = buf;
+  g_new_program = true;
 }
 
 static void receive_config() {
@@ -433,6 +506,10 @@ void setup() {
   g_fs_ok = LittleFS.begin(true);
   g_cfg_lock = xSemaphoreCreateMutex();
   config_load();
+  // Start the WiFi driver now (not connected yet): its tasks and buffers need ~50 KB of internal RAM that would
+  // not be available once the program image and the Kotlin heap are allocated.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   Serial.printf("\n[ktvm] KTVM ready - Kotlin on ESP32 (free heap %u B, largest block %u B%s)\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)hal_largest_free_block(), g_fs_ok ? "" : ", NO FILESYSTEM");
   config_print();

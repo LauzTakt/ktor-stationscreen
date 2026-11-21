@@ -28,6 +28,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from mock_api import MockTwinApi, WsSession
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "screen_ui.html")
 CMD = 0x1E
@@ -625,114 +627,6 @@ class DeviceSource:
     label = property(lambda self: f"ESP32 ({self.port})" if self.ser else "no ESP32 connected: waiting for USB")
 
 
-# ------------------------------------------------------------------ mock train-incidents API
-LINES = ["IC1", "IC5", "IR15", "IR90", "RE33", "S1", "S2", "S3"]
-# Station IDs (UIC-style numbers). A board picks its station with `./ktesp config station=<id>`.
-STATION_IDS = {
-    "Lausanne": "8501120", "Genève": "8501008", "Genève-Aéroport": "8501026", "Renens VD": "8501118",
-    "Morges": "8501037", "Yverdon-les-Bains": "8504200", "Fribourg": "8504100", "Bern": "8507000",
-    "Luzern": "8505000", "Neuchâtel": "8504221", "Biel/Bienne": "8504300", "Vevey": "8501200", "Montreux": "8501300",
-}
-STATION_NAMES = {v: k for k, v in STATION_IDS.items()}
-STATIONS = list(STATION_IDS)
-CAUSES = [
-    ("Overhead line fault", "high"), ("Defective train", "medium"), ("Planned engineering works", "low"),
-    ("Signal box failure", "critical"), ("Emergency services operation", "critical"), ("Points failure", "high"),
-    ("Staff shortage", "medium"), ("Severe weather", "medium"), ("Late running of a previous train", "low"),
-]
-MESSAGES = {
-    "critical": ["No service between {a} and {b}", "Service suspended. Replacement buses from {a}"],
-    "high": ["Single-track operation between {a} and {b}", "Reduced frequency between {a} and {b}"],
-    "medium": ["Delays expected towards {b}", "Some trains do not stop at {a}"],
-    "low": ["Possible delays towards {b}", "Modified timetable at {a}"],
-}
-
-
-class MockApi:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.incidents = {}
-        self.next_id = 1040
-        self.ws_clients = []
-        self.auto = True
-        for _ in range(3):
-            self._new(time.time() - random.randint(60, 1800))
-        threading.Thread(target=self._auto_loop, daemon=True).start()
-
-    def _new(self, since=None):
-        cause, sev = random.choice(CAUSES)
-        a, b = random.sample(STATIONS, 2)
-        at = random.choice([a, b] + STATIONS[:3])
-        line = random.choice(LINES)
-        self.next_id += 1
-        inc = {
-            "id": f"INC-{self.next_id}", "line": line, "from": a, "to": b,
-            "station": at, "stations": sorted({STATION_IDS[a], STATION_IDS[b], STATION_IDS[at]}),
-            "cause": cause, "severity": sev,
-            "delayMin": {"critical": 0, "high": random.choice([15, 20, 30]), "medium": random.choice([5, 10, 15]),
-                         "low": random.choice([0, 3, 5])}[sev],
-            "since": int(since or time.time()), "updated": int(time.time()),
-            "message": random.choice(MESSAGES[sev]).format(a=a, b=b),
-        }
-        self.incidents[inc["id"]] = inc
-        return inc
-
-    def snapshot(self, station=None):
-        with self.lock:
-            incs = [i for i in self.incidents.values() if not station or station in i["stations"]]
-            out = {"now": int(time.time()), "incidents": incs}
-            if station:
-                out["station"] = {"id": station, "name": STATION_NAMES.get(station, f"Station {station}")}
-            return out
-
-    def _push(self, msg):
-        msg["now"] = int(time.time())
-        data = json.dumps(msg, ensure_ascii=False)
-        for q in list(self.ws_clients):
-            q.put(data)
-
-    def action(self, what):
-        with self.lock:
-            if what == "new":
-                self._push({"type": "upsert", "incident": self._new()})
-            elif what == "update" and self.incidents:
-                inc = random.choice(list(self.incidents.values()))
-                sevs = ["low", "medium", "high", "critical"]
-                base = dict(CAUSES)[inc["cause"]]
-                if random.random() < 0.3:  # escalate one level or go back to the cause's usual severity
-                    up = sevs[min(3, sevs.index(base) + 1)]
-                    inc["severity"] = base if inc["severity"] != base else up
-                    inc["message"] = random.choice(MESSAGES[inc["severity"]]).format(a=inc["from"], b=inc["to"])
-                if inc["severity"] == "critical":
-                    inc["delayMin"] = 0
-                else:
-                    inc["delayMin"] = max(0, inc["delayMin"] + random.choice([-5, 5, 10]))
-                inc["updated"] = int(time.time())
-                self._push({"type": "upsert", "incident": inc})
-            elif what == "resolve" and self.incidents:
-                iid = random.choice(list(self.incidents))
-                del self.incidents[iid]
-                self._push({"type": "resolved", "id": iid})
-            elif what == "clear":
-                for iid in list(self.incidents):
-                    del self.incidents[iid]
-                    self._push({"type": "resolved", "id": iid})
-            elif what == "auto-on":
-                self.auto = True
-            elif what == "auto-off":
-                self.auto = False
-            return {"auto": self.auto, "count": len(self.incidents), "ws": len(self.ws_clients)}
-
-    def _auto_loop(self):
-        while True:
-            time.sleep(random.uniform(7, 14))
-            if not self.auto:
-                continue
-            n = len(self.incidents)
-            r = random.random()
-            self.action("new" if n < 2 or (r < 0.35 and n < 7) else ("resolve" if r < 0.6 else "update"))
-
-
 # ------------------------------------------------------------------ WebSocket server (minimal)
 def ws_send(sock, text):
     data = text.encode()
@@ -746,24 +640,33 @@ def ws_send(sock, text):
     sock.sendall(hdr + data)
 
 
-def ws_read_frame(sock):
-    """Reads one client frame; returns the opcode (or None if the peer went away)."""
-    h = sock.recv(2)
-    if len(h) < 2:
-        return None
-    n = h[1] & 0x7F
-    if n == 126:
-        n = struct.unpack("!H", sock.recv(2))[0]
-    elif n == 127:
-        n = struct.unpack("!Q", sock.recv(8))[0]
-    if h[1] & 0x80:
-        sock.recv(4)
-    while n > 0:
-        chunk = sock.recv(min(n, 4096))
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
-        n -= len(chunk)
-    return h[0] & 0x0F
+        buf += chunk
+    return buf
+
+
+def ws_read_frame(sock):
+    """Reads one client frame: (opcode, payload) or (None, None) if the peer went away."""
+    h = _recv_exact(sock, 2)
+    if not h:
+        return None, None
+    n = h[1] & 0x7F
+    if n == 126:
+        n = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif n == 127:
+        n = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    mask = _recv_exact(sock, 4) if h[1] & 0x80 else None
+    data = _recv_exact(sock, n) if n else b""
+    if data is None:
+        return None, None
+    if mask:
+        data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+    return h[0] & 0x0F, data
 
 
 # ------------------------------------------------------------------ HTTP server
@@ -799,16 +702,14 @@ def make_handler(app):
                 self.wfile.write(body)
             elif path == "/events":
                 self._events()
-            elif path == "/api/incidents":
-                q = parse_qs(urlparse(self.path).query)
-                self._json(app.api.snapshot((q.get("station") or [None])[0]))
-            elif path == "/api/stations":
-                self._json([{"id": i, "name": n} for n, i in STATION_IDS.items()])
+            elif path == "/api/v1/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                self._websocket()
+            elif path.startswith("/api/v1/"):
+                code, obj = app.api.get(path, parse_qs(urlparse(self.path).query))
+                self._json(obj, code)
             elif path == "/api/info":
                 self._json({"source": app.source.label, "lanIp": lan_ip(), "port": app.port,
-                            "auto": app.api.auto, "ws": len(app.api.ws_clients), **app.hub.stats})
-            elif path == "/ws/incidents" and self.headers.get("Upgrade", "").lower() == "websocket":
-                self._websocket()
+                            "auto": app.api.auto, "ws": len(app.api.sessions), **app.hub.stats})
             else:
                 self._json({"error": "not found"}, 404)
 
@@ -855,24 +756,36 @@ def make_handler(app):
                              b"Sec-WebSocket-Accept: " + acc + b"\r\n\r\n")
             self.wfile.flush()
             sock = self.connection
-            q = queue.Queue()
-            app.api.ws_clients.append(q)
+            wlock = threading.Lock()
+
+            def send(obj):
+                with wlock:
+                    try:
+                        ws_send(sock, json.dumps(obj, ensure_ascii=False))
+                    except OSError:
+                        pass
+
+            session = WsSession(app.api, send)
+            app.api.sessions.append(session)
             peer = self.client_address[0]
             app.hub.text(f"[api] websocket connected from {peer}\n")
             try:
-                ws_send(sock, json.dumps({"type": "hello", "now": int(time.time())}))
                 while True:
                     r, _, _ = select.select([sock], [], [], 0.2)
                     if r:
-                        op = ws_read_frame(sock)
+                        op, data = ws_read_frame(sock)
                         if op is None or op == 0x8:
                             break
-                    while not q.empty():
-                        ws_send(sock, q.get())
+                        if op == 0x9:
+                            with wlock:
+                                sock.sendall(bytes([0x8A, len(data)]) + data)
+                        elif op == 0x1:
+                            session.on_text(data.decode("utf-8", "replace"))
+                    session.tick()
             except OSError:
                 pass
             finally:
-                app.api.ws_clients.remove(q)
+                app.api.sessions.remove(session)
                 app.hub.text(f"[api] websocket disconnected ({peer})\n")
             self.close_connection = True
 
@@ -881,14 +794,14 @@ def make_handler(app):
 
 def serve(source, port=8765, open_browser=True):
     hub = source.parser.hub
-    api = MockApi()
+    api = MockTwinApi(hub.text)
     app = App(source, hub, api, port)
     ThreadingHTTPServer.daemon_threads = True
     ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(app))
     url = f"http://localhost:{port}/"
     log(f"screen emulator at {url}")
-    log(f"mock disruptions API: http://{lan_ip()}:{port}/api/incidents  ws://{lan_ip()}:{port}/ws/incidents")
+    log(f"mock twin API: http://{lan_ip()}:{port}/api/v1  ws://{lan_ip()}:{port}/api/v1/ws")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     source.start()
     if open_browser:

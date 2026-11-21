@@ -164,7 +164,7 @@ done:
 }
 
 // ---------------------------------------------------------------- WebSocket
-struct Ws { bool used; int h; Buf rx; Buf msg; bool open; };
+struct Ws { bool used; int h; Buf rx; Buf msg; bool open; size_t skip; bool skipping_msg; };
 static Ws g_ws[NET_MAX_WS];
 
 static bool ws_frame(Ws* w, int op, const uint8_t* d, size_t n) {
@@ -221,6 +221,12 @@ static Ws* ws_get(int h) { return h >= 0 && h < NET_MAX_WS && g_ws[h].used ? &g_
 // Try to take one complete frame out of w->rx. 1 = message complete, 0 = need more, -1 = closed.
 static int ws_parse(Ws* w, char** msg, size_t* len) {
   while (true) {
+    if (w->skip) {  // discarding the rest of an oversized frame
+      size_t k = w->skip < w->rx.n ? w->skip : w->rx.n;
+      buf_drop(&w->rx, k);
+      w->skip -= k;
+      if (w->skip) return 0;
+    }
     if (w->rx.n < 2) return 0;
     uint8_t* d = w->rx.d;
     bool fin = d[0] & 0x80;
@@ -235,7 +241,16 @@ static int ws_parse(Ws* w, char** msg, size_t* len) {
       hl = 10;
     }
     if (masked) hl += 4;
-    if (n > NET_MAX_BODY) { set_err("websocket message too large"); return -1; }
+    if (n > NET_MAX_BODY || (op == 0x0 && w->skipping_msg)) {
+      // Too big for the board: drop it (and its continuation frames) instead of breaking the connection.
+      if (w->rx.n < hl) return 0;
+      buf_drop(&w->rx, hl);
+      w->skip = n;
+      w->skipping_msg = !fin;
+      w->msg.n = 0;
+      hal_write("[net] websocket message too large, skipped\n", 43);
+      continue;
+    }
     if (w->rx.n < hl + n) return 0;
     uint8_t* p = d + hl;
     if (masked) for (size_t i = 0; i < n; i++) p[i] ^= d[hl - 4 + (i & 3)];

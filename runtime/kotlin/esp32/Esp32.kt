@@ -37,6 +37,9 @@ external fun boardName(): String
 /** GPIO of the board's user LED (ESP32 DevKit: 2, Raspberry Pi: 17 by default, configurable on the agent). */
 external fun boardLedPin(): Int
 
+/** UTC wall-clock time in epoch milliseconds, or 0 if the clock was never set (see esp32.net.ntpSync). */
+external fun epochMillis(): Long
+
 /** A setting stored on the board (set with `./ktesp config key=value`), or null if it is not set. */
 external fun deviceConfig(key: String): String?
 /** Unique hardware id of this board (from its MAC address); "SIMULATOR" in the desktop simulator. */

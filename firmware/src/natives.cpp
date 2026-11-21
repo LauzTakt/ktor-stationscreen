@@ -529,6 +529,12 @@ int native_call(uint16_t nid, uint32_t* a) {
       return ret_cstr(a, v);
     }
     case N_esp32_Esp32Kt_deviceId_Ljava_lang_String: return ret_cstr(a, hal_device_id());
+    // ---- wall clock
+    case N_esp32_net_NetKt_ntpSync_Ljava_lang_String_I_Z:
+      NEED_STR(a[0], "ntpSync(server)");
+      a[0] = hal_ntp_sync(str_chars(a[0]), (int32_t)a[1]) ? 1 : 0;
+      return vm_abort_flag ? ST_ABORT : ST_OK;
+    case N_esp32_Esp32Kt_epochMillis_J: putL(a, hal_epoch_ms()); return ST_OK;
     default: return vm_fatal("native %u not implemented", nid);
   }
 }

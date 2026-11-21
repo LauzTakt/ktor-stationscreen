@@ -100,9 +100,9 @@
       <pre class="log" id="bus" style="height:140px"></pre>
     </div>
     <div class="panel">
-      <h2>Disruptions API (mock)</h2>
+      <h2>Twin API v1 (mock)</h2>
       <div class="row">
-        <button class="primary" data-a="new">+ New disruption</button>
+        <button class="primary" data-a="new">+ New incident</button>
         <button data-a="update">Update one</button>
         <button data-a="resolve">Resolve one</button>
         <button data-a="clear">Resolve all</button>
@@ -225,15 +225,15 @@ async function info() {
     document.getElementById('src').textContent = r.source;
     document.getElementById('auto').checked = r.auto;
     document.getElementById('api').innerHTML =
-      `From the ESP32: <code>http://${r.lanIp}:${r.port}/api/incidents</code> · ` +
-      `<code>ws://${r.lanIp}:${r.port}/ws/incidents</code> · WS clients: <b>${r.ws}</b> · ` +
+      `Mock twin API: <code>http://${r.lanIp}:${r.port}/api/v1</code> · ` +
+      `<code>ws://${r.lanIp}:${r.port}/api/v1/ws</code> · WS clients: <b>${r.ws}</b> · ` +
       `link frames: ${r.frames}${r.badFrames ? ` (<span class="bad">${r.badFrames} corrupted</span>)` : ''}`;
   } catch (e) {}
 }
 setInterval(info, 2000); info();
-fetch('/api/stations').then(r => r.json()).then(list => {
+fetch('/api/v1/stations?limit=100').then(r => r.json()).then(list => {
   document.getElementById('stations').innerHTML = 'Station IDs (<code>./ktesp config station=ID</code>): ' +
-    list.map(st => `${st.name} <code>${st.id}</code>`).join(' · ');
+    list.map(st => `${st.name} <code>${st.stopId}</code>`).join(' · ');
 }).catch(() => {});
 
 const post = u => fetch(u, { method: 'POST' }).then(info);

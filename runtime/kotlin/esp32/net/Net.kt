@@ -8,6 +8,13 @@ external fun wifiConnect(ssid: String, password: String, timeoutMs: Int): Boolea
 external fun wifiIp(): String
 /** HTTP(S) GET. Returns the body or null on network error; see [httpStatus]. */
 external fun httpGet(url: String, timeoutMs: Int): String?
+/**
+ * Sets the board's clock from an NTP server (needs WiFi). Returns false on timeout. Afterwards [esp32.epochMillis]
+ * gives the UTC time. In the simulator the computer's clock is used.
+ */
+external fun ntpSync(server: String, timeoutMs: Int): Boolean
+fun ntpSync(server: String = "pool.ntp.org"): Boolean = ntpSync(server, 8000)
+
 /** Status code of the last [httpGet] (-1 = network error). */
 external fun httpStatus(): Int
 external fun wsOpen(url: String, timeoutMs: Int): Int

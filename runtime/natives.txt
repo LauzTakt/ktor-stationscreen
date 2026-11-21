@@ -116,3 +116,6 @@ esp32/screen/ScreenKt.tftBacklight(Z)V
 # ---- device identity and configuration (stored on the board, outside the program)
 esp32/Esp32Kt.deviceConfig(Ljava/lang/String;)Ljava/lang/String;
 esp32/Esp32Kt.deviceId()Ljava/lang/String;
+# ---- wall clock (NTP)
+esp32/net/NetKt.ntpSync(Ljava/lang/String;I)Z
+esp32/Esp32Kt.epochMillis()J

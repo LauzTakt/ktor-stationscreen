@@ -1,13 +1,18 @@
-// Train disruption board for a 320x240 TFT, running in Kotlin on the ESP32.
+// Station departure board for a 320x240 TFT, running in Kotlin on the ESP32.
 //
-// Each board serves one station: its station ID is a device setting (`./ktesp config station=8501120`),
-// so every screen runs the same program image.
+// Each board serves one station: its UIC/DIDOK stop id is a device setting (`./ktesp config station=8501120`), so
+// every screen runs the same program image. The API address can be a device setting too (`./ktesp config api=...`),
+// overriding API_BASE in Config.kt.
 //
-//   1. GET /api/incidents?station=ID   -> initial state + station name
-//   2. WS  /ws/incidents?station=ID    -> live changes (upsert / resolved)
-//   3. enrichment on the board: keep only disruptions affecting this station, severity -> colour,
-//      relative times, worst delay, sorting by severity
-//   4. drawing on an ILI9341 TFT: a real one over SPI, or the one emulated on the Mac (./ktesp screen examples/trains)
+// Start-up: WiFi -> NTP (wall clock) -> twin API. The data comes pre-digested for small displays from the twin API
+// (ktor_app, docs/API.md "Station screen"), about 1 KB per update:
+//
+//   WS    /api/v1/ws  {"op":"subscribe","topic":"screen","id":<stopId>,"limit":N}   pushed every SCREEN_FREQ_SEC and
+//                                                                                   immediately on incident changes
+//   REST  GET /api/v1/stations/{id}/screen?limit=N                                  fallback while the WS is down
+//
+// Enrichment on the board: Swiss local time, delay in minutes, cancelled trains, line pictograms, rotating banner.
+// Drawing is incremental: every zone remembers what it shows and is only repainted when that changes.
 package trains
 
 import esp32.*
@@ -15,260 +20,330 @@ import esp32.json.*
 import esp32.net.*
 import esp32.screen.*
 
+const val ROWS_MAX = 6
+const val SCREEN_FREQ_SEC = 30
+const val REST_POLL_MS = 20000
+
 // ------------------------------------------------------------------ model
-enum class Severity(val label: String, val rank: Int) {
-    CRITICAL("critical", 0),
-    HIGH("high", 1),
-    MEDIUM("medium", 2),
-    LOW("low", 3);
+enum class Severity(val rank: Int) {
+    CRITICAL(0), MAJOR(1), MINOR(2), INFO(3);
 
     companion object {
-        fun of(s: String) = when (s) {
+        fun of(s: String?) = when (s) {
             "critical" -> CRITICAL
-            "high" -> HIGH
-            "medium" -> MEDIUM
-            else -> LOW
+            "major" -> MAJOR
+            "minor" -> MINOR
+            else -> INFO
         }
     }
 }
 
+class Departure(
+    val line: String, val category: String, val destination: String,
+    val plannedMs: Long, val delaySec: Int, val cancelled: Boolean, val atStation: Boolean,
+)
+
 class Incident(
-    val id: String, val line: String, val from: String, val to: String, val station: String,
-    val cause: String, val severity: Severity, val delayMin: Int, val since: Long, val message: String,
-    /** IDs of the stations affected by this disruption. */
-    val stations: List<String>,
+    val id: String, val title: String, val where: String, val severity: Severity,
+    /** true = at the station itself; false = it only affects trains that will call here. */
+    val atStation: Boolean, val trains: Int,
 )
 
-fun parseIncident(o: JsonObject) = Incident(
-    id = o.str("id"), line = o.str("line", "?"), from = o.str("from"), to = o.str("to"),
-    station = o.str("station"), cause = o.str("cause"), severity = Severity.of(o.str("severity")),
-    delayMin = o.int("delayMin"), since = o.long("since"), message = o.str("message"),
-    stations = o.arr("stations").list.mapNotNull { it as? String },
-)
-
-// ------------------------------------------------------------------ enrichment
-fun ago(seconds: Long): String = when {
-    seconds < 60 -> "just now"
-    seconds < 3600 -> "${seconds / 60} min ago"
-    else -> "${seconds / 3600} h ${(seconds % 3600) / 60} min ago"
+// ------------------------------------------------------------------ time (Europe/Zurich)
+/** Days since 1970-01-01 -> year (Howard Hinnant's civil_from_days). */
+fun yearOf(days: Long): Int {
+    val z = days + 719468
+    val era = (if (z >= 0) z else z - 146096) / 146097
+    val doe = z - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val m = if (mp < 10) mp + 3 else mp - 9
+    return (yoe + era * 400 + (if (m <= 2) 1 else 0)).toInt()
 }
 
-/** Central European time (no daylight saving) from a Unix epoch. */
-fun clock(epoch: Long): String {
-    val t = ((epoch + 3600) % 86400 + 86400) % 86400
+/** Days since 1970-01-01 of the last Sunday of [month] in [year]. */
+fun lastSunday(year: Int, month: Int): Long {
+    val nextY = if (month == 12) year + 1 else year
+    val nextM = if (month == 12) 1 else month + 1
+    val y = (if (nextM <= 2) nextY - 1 else nextY).toLong()
+    val era = (if (y >= 0) y else y - 399) / 400
+    val yoe = y - era * 400
+    val mp = ((nextM + 9) % 12).toLong()
+    val doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * mp + 2) / 5
+    val last = era * 146097 + doe - 719468 - 1          // last day of [month]
+    val dow = ((last + 4) % 7 + 7) % 7                   // 0 = Sunday (1970-01-01 was a Thursday)
+    return last - dow
+}
+
+/** UTC offset of Europe/Zurich in seconds (CET/CEST: last Sunday of March/October at 01:00 UTC). */
+fun zurichOffset(epochSec: Long): Int {
+    val year = yearOf(Math.floorDiv(epochSec, 86400L))
+    val start = lastSunday(year, 3) * 86400 + 3600
+    val end = lastSunday(year, 10) * 86400 + 3600
+    return if (epochSec >= start && epochSec < end) 7200 else 3600
+}
+
+fun hhmm(epochMs: Long): String {
+    val s = epochMs / 1000
+    val t = Math.floorMod(s + zurichOffset(s), 86400L)
     val h = (t / 3600).toInt()
     val m = ((t % 3600) / 60).toInt()
     return "${if (h < 10) "0" else ""}$h:${if (m < 10) "0" else ""}$m"
 }
 
+fun ago(seconds: Long): String = when {
+    seconds < 60 -> "${seconds} s ago"
+    seconds < 3600 -> "${seconds / 60} min ago"
+    else -> "${seconds / 3600} h ago"
+}
+
 // ------------------------------------------------------------------ state
-/** State of the board for one station ([stationId] null = show the whole network). */
-class Panel(val stationId: String?) {
+class StationBoard(val stationId: String) {
     var stationName: String? = null
-    val incidents = LinkedHashMap<String, Incident>()
-    val firstSeen = HashMap<String, Int>()        // millis() when an incident appeared / changed (highlight)
-    private var clockOffset = 0L                   // server epoch - local seconds
+    var departures: List<Departure> = emptyList()
+    var incidents: List<Incident> = emptyList()
+    private var twinOffsetMs = 0L               // twin clock - millis(), used until NTP has set the clock
     var lastUpdateMs = 0
     var hasData = false
     var live = false
     var demo = false
     var status = "Connecting"
 
-    /** Enrichment step 1: does this disruption concern our station? */
-    fun affects(inc: Incident) = stationId == null || inc.stations.contains(stationId)
+    val title: String get() = stationName ?: "Station $stationId"
 
-    val title: String get() = stationName ?: if (stationId != null) "Station $stationId" else "Disruptions"
-
-    fun now(): Long = clockOffset + millis() / 1000
-
-    fun syncClock(serverNow: Long) {
-        if (serverNow > 0) clockOffset = serverNow - millis() / 1000
+    /** Wall clock: NTP if it was set, else the twin clock of the last update. */
+    fun nowMs(): Long {
+        val wall = epochMillis()
+        return if (wall > 0) wall else twinOffsetMs + millis()
     }
 
-    fun load(json: String) {
-        val o = Json.parseObject(json)
-        syncClock(o.long("now"))
-        o.obj("station")?.strOrNull("name")?.let { stationName = it }
-        incidents.clear()
-        for (it in o.arr("incidents").objects()) {
-            val inc = parseIncident(it)
-            if (affects(inc)) incidents[inc.id] = inc
-        }
-        lastUpdateMs = millis()
-        hasData = true
-    }
-
-    /** Applies a WebSocket event. Returns true if something changed. */
-    fun apply(json: String): Boolean {
-        val o = Json.parseObject(json)
-        syncClock(o.long("now"))
-        lastUpdateMs = millis()
-        when (o.str("type")) {
-            "upsert" -> {
-                val inc = parseIncident(o.obj("incident") ?: return false)
-                if (!affects(inc)) {   // not (or no longer) relevant for this station
-                    firstSeen.remove(inc.id)
-                    return incidents.remove(inc.id) != null
-                }
-                val isNew = !incidents.containsKey(inc.id)
-                incidents[inc.id] = inc
-                firstSeen[inc.id] = millis()
-                println(if (isNew) "+ ${inc.id} ${inc.line} ${inc.cause}" else "~ ${inc.id} ${inc.severity.label} +${inc.delayMin} min")
-                return true
-            }
-            "resolved" -> {
-                val id = o.str("id")
-                firstSeen.remove(id)
-                if (incidents.remove(id) != null) { println("- $id resolved"); return true }
-            }
+    /** A `Screen` document (REST body), or a WebSocket message (`screen_update` carries it in `data`). */
+    fun onJson(json: String): Boolean {
+        val m = Json.parseObject(json)
+        val type = m.strOrNull("type")
+        if (type == null) { load(m); return true }
+        when (type) {
+            "screen_update" -> { load(m.obj("data") ?: return false); return true }
+            "subscribed" -> println("subscribed to screen ${m.str("id")}")
+            "error" -> println("api error ${m.str("code")}: ${m.str("message")}")
         }
         return false
     }
 
-    fun sorted(): List<Incident> =
-        incidents.values.sortedWith(Comparator { a, b ->
-            when {
-                a.severity.rank != b.severity.rank -> a.severity.rank - b.severity.rank
-                a.delayMin != b.delayMin -> b.delayMin - a.delayMin
-                else -> b.since.compareTo(a.since)
-            }
-        })
+    private fun load(s: JsonObject) {
+        val now = s.long("now")
+        if (now > 0) twinOffsetMs = now - millis()
+        s.strOrNull("name")?.let { stationName = it }
+        val deps = ArrayList<Departure>()
+        for (d in s.arr("departures").objects()) {
+            val line = d.str("line", "?")
+            deps.add(Departure(line, d.str("category", line), d.str("to", "?"), d.long("plannedTime"),
+                d.int("delaySec"), d.bool("cancelled"), d.bool("atStation")))
+        }
+        val incs = ArrayList<Incident>()
+        for (i in s.arr("incidents").objects()) {
+            incs.add(Incident(i.str("id"), i.str("title"), i.str("where"), Severity.of(i.strOrNull("severity")),
+                i.bool("atStation"), i.int("trains")))
+        }
+        if (incs.size != incidents.size) println("${incs.size} incident(s), ${deps.size} departures at $title")
+        departures = deps
+        incidents = incs   // already sorted worst first by the server
+        lastUpdateMs = millis()
+        hasData = true
+    }
 }
 
 // ------------------------------------------------------------------ drawing (320x240)
 // Swiss railway board style: red header, white background, grey scale, hairline separators.
-// No full-screen clears: a real TFT shows every write immediately, so each zone repaints its own background.
-const val RED = 0xEB0000          // brand red
-const val CHARCOAL = 0x212121     // primary text
-const val GRANITE = 0x686868      // secondary text
-const val METAL = 0x767676        // tertiary text
-const val SILVER = 0xDCDCDC       // separators
-const val MILK = 0xF6F6F6         // bands and subtle highlight
+const val RED = 0xEB0000
+const val CHARCOAL = 0x212121
+const val GRANITE = 0x686868
+const val METAL = 0x767676
+const val SILVER = 0xDCDCDC
+const val MILK = 0xF6F6F6
 const val WHITE = 0xFFFFFF
 const val BLUE = 0x2D327D
+const val SCREEN_BG = WHITE
 
 const val HEADER_H = 28
-const val BAND_H = 16
-const val ROW_H = 60
-const val ROWS_PER_PAGE = 3
+const val BANNER_H = 34
+const val COLS_H = 14
+const val ROW_H = 28
 const val FOOTER_H = 16
-const val SCREEN_BG = WHITE
 
 fun severityColor(s: Severity) = when (s) {
     Severity.CRITICAL -> RED
-    Severity.HIGH -> 0xF27E00
-    Severity.MEDIUM -> 0xFCBB00
-    Severity.LOW -> BLUE
+    Severity.MAJOR -> 0xF27E00
+    Severity.MINOR -> 0xFCBB00
+    Severity.INFO -> BLUE
 }
 
-fun render(s: Screen, p: Panel, page: Int) {
-    val list = p.sorted()
-    val pages = maxOf(1, (list.size + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE)
-    val pg = page % pages
-    val w = s.width
+fun bannerBg(s: Severity) = when (s) {
+    Severity.CRITICAL, Severity.MAJOR -> 0xFDECEC
+    Severity.MINOR -> 0xFFF6DB
+    Severity.INFO -> MILK
+}
 
-    // red header: title and clock
-    s.fillRect(0, 0, w, HEADER_H, RED)
-    val clockW = if (p.hasData) Screen.textWidth("00:00", 2) + 12 else 0
-    s.text(10, 7, Screen.ellipsize(p.title, w - 20 - clockW, 2), WHITE, 2, RED)
-    if (p.hasData) s.textRight(w - 10, 7, clock(p.now()), WHITE, 2, RED)
+fun isLongDistance(category: String): Boolean {
+    val c = category.uppercase()
+    return c == "IC" || c == "IR" || c == "EC" || c == "ICE" || c == "TGV" || c == "ICN" || c == "RJX" ||
+        c == "EN" || c == "NJ"
+}
 
-    // summary band
-    val by = HEADER_H
-    s.fillRect(0, by, w, BAND_H, MILK)
-    if (list.isEmpty()) {
-        s.text(10, by + 4, "Normal service", GRANITE, 1, MILK)
-    } else {
-        val cut = list.count { it.severity == Severity.CRITICAL }
-        var summary = "${list.size} disruption${if (list.size == 1) "" else "s"}"
-        if (cut > 0) summary += " · $cut cancelled"
-        s.text(10, by + 4, summary, CHARCOAL, 1, MILK)
-        val maxDelay = list.maxOf { it.delayMin }
-        if (maxDelay > 0) s.textRight(w - 10, by + 4, "max. +$maxDelay'", RED, 1, MILK)
-    }
+/**
+ * Incremental renderer: each zone keeps a key of what it shows and is repainted only when the key changes,
+ * so a typical update touches one or two rows instead of the whole panel.
+ */
+class Renderer(val s: Screen) {
+    private var headerKey = ""
+    private var bannerKey = ""
+    private var footerKey = ""
+    private var layoutBanner: Boolean? = null
+    private val rowKeys = arrayOfNulls<String>(ROWS_MAX + 2)
 
-    // rows
-    val top = HEADER_H + BAND_H
-    if (list.isEmpty()) {
-        s.fillRect(0, top, w, s.height - top - FOOTER_H, SCREEN_BG)
-        s.textCentered(0, w, 96, "No disruptions", CHARCOAL, 2, SCREEN_BG)
-        s.textCentered(0, w, 122, if (p.stationId != null) "All trains at this station are running normally"
-            else "All lines are running normally", GRANITE, 1, SCREEN_BG)
-    } else {
-        val start = pg * ROWS_PER_PAGE
-        for (slot in 0 until ROWS_PER_PAGE) {
-            val y = top + slot * ROW_H
-            val i = start + slot
-            if (i < list.size) row(s, list[i], p, y, slot < ROWS_PER_PAGE - 1 && i + 1 < list.size)
-            else s.fillRect(0, y, w, ROW_H, SCREEN_BG)
+    fun render(b: StationBoard, tick: Int) {
+        val w = s.width
+        val hasBanner = b.incidents.isNotEmpty()
+        if (layoutBanner != hasBanner) {          // layout changes: forget everything below the header
+            layoutBanner = hasBanner
+            bannerKey = ""
+            for (i in rowKeys.indices) rowKeys[i] = null
+            val top = HEADER_H + (if (hasBanner) BANNER_H else 0)
+            s.fillRect(0, top, w, COLS_H, SCREEN_BG)
+            s.text(8, top + 4, "Departure", METAL, 1, SCREEN_BG)
+            s.text(98, top + 4, "Line", METAL, 1, SCREEN_BG)
+            s.text(138, top + 4, "Destination", METAL, 1, SCREEN_BG)
+        }
+
+        // header: station + clock (repainted when the minute changes)
+        val clock = if (b.hasData || epochMillis() > 0) hhmm(b.nowMs()) else ""
+        val hk = "${b.title}|$clock"
+        if (hk != headerKey) {
+            headerKey = hk
+            s.fillRect(0, 0, w, HEADER_H, RED)
+            val clockW = if (clock.isEmpty()) 0 else Screen.textWidth(clock, 2) + 12
+            s.text(10, 7, Screen.ellipsize(b.title, w - 20 - clockW, 2), WHITE, 2, RED)
+            if (clock.isNotEmpty()) s.textRight(w - 10, 7, clock, WHITE, 2, RED)
+        }
+
+        // incident banner (rotates every few seconds when there are several)
+        if (hasBanner) {
+            val n = b.incidents.size
+            val inc = b.incidents[tick % n]
+            val counter = if (n > 1) "${tick % n + 1}/$n" else ""
+            val bk = "${inc.id}|${inc.severity}|${inc.title}|${inc.trains}|$counter"
+            if (bk != bannerKey) {
+                bannerKey = bk
+                val y = HEADER_H
+                val bg = bannerBg(inc.severity)
+                s.fillRect(0, y, w, BANNER_H, bg)
+                s.fillRect(0, y, 4, BANNER_H, severityColor(inc.severity))
+                val cw = if (counter.isEmpty()) 0 else Screen.textWidth(counter) + 8
+                if (counter.isNotEmpty()) s.textRight(w - 8, y + 5, counter, METAL, 1, bg)
+                val lines = Screen.wrap(inc.title, w - 18 - cw, 1, 2)
+                s.text(12, y + 5, lines[0], CHARCOAL, 1, bg)
+                val trains = "${inc.trains} train${if (inc.trains == 1) "" else "s"}"
+                val second = when {
+                    lines.size > 1 -> lines[1]
+                    !inc.atStation -> "Affects $trains calling here"
+                    inc.trains > 0 -> "At this station · $trains affected"
+                    else -> "At this station"
+                }
+                s.text(12, y + 19, Screen.ellipsize(second, w - 20), GRANITE, 1, bg)
+            }
+        }
+
+        // departures, one zone per row
+        val top = HEADER_H + (if (hasBanner) BANNER_H else 0) + COLS_H
+        val bottom = s.height - FOOTER_H
+        val rows = minOf(ROWS_MAX, (bottom - top) / ROW_H)
+        if (!b.hasData || b.departures.isEmpty()) {
+            val msg = if (!b.hasData) "Loading departures..." else "No departures in the next 2 hours"
+            if (rowKeys[0] != "msg:$msg") {
+                for (i in rowKeys.indices) rowKeys[i] = null
+                rowKeys[0] = "msg:$msg"
+                s.fillRect(0, top, w, bottom - top, SCREEN_BG)
+                s.textCentered(0, w, top + (bottom - top) / 2 - 4, msg, GRANITE, 1, SCREEN_BG)
+            }
+        } else {
+            if (rowKeys[0]?.startsWith("msg:") == true) {
+                rowKeys[0] = null
+                s.fillRect(0, top, w, bottom - top, SCREEN_BG)
+            }
+            for (i in 0 until rows) {
+                val d = if (i < b.departures.size) b.departures[i] else null
+                val sep = d != null && i < b.departures.size - 1 && i < rows - 1
+                val key = if (d == null) "" else
+                    "${d.plannedMs}|${(d.delaySec + 30) / 60}|${d.line}|${d.category}|${d.destination}|${d.cancelled}|$sep"
+                if (key != rowKeys[i]) {
+                    rowKeys[i] = key
+                    val y = top + i * ROW_H
+                    s.fillRect(0, y, w, ROW_H, SCREEN_BG)
+                    if (d != null) row(d, y, sep)
+                }
+            }
+            val rest = top + rows * ROW_H
+            if (rest < bottom && rowKeys[ROWS_MAX + 1] != "pad$rest") {
+                rowKeys[ROWS_MAX + 1] = "pad$rest"
+                s.fillRect(0, rest, w, bottom - rest, SCREEN_BG)
+            }
+        }
+
+        // footer
+        val source = if (b.demo) "Demo" else if (b.live) "Live" else b.status
+        val right = if (!b.hasData) source else "$source · ${ago(((millis() - b.lastUpdateMs) / 1000).toLong())}"
+        val fk = "${b.stationId}|$right|${b.live || b.demo}"
+        if (fk != footerKey) {
+            footerKey = fk
+            s.fillRect(0, bottom, w, FOOTER_H, SCREEN_BG)
+            s.drawLine(0, bottom, w, bottom, SILVER)
+            s.text(8, bottom + 5, "ID ${b.stationId}", METAL, 1, SCREEN_BG)
+            s.textRight(w - 8, bottom + 5, right, if (b.live || b.demo) METAL else RED, 1, SCREEN_BG)
         }
     }
 
-    // footer
-    val fy = s.height - FOOTER_H
-    s.fillRect(0, fy, w, FOOTER_H, SCREEN_BG)
-    s.drawLine(0, fy, w, fy, SILVER)
-    var left = if (p.stationId != null) "ID ${p.stationId}" else "All stations"
-    if (pages > 1) left += " · ${pg + 1}/$pages"
-    s.text(10, fy + 5, left, METAL, 1, SCREEN_BG)
-    val source = if (p.demo) "Demo" else if (p.live) "Live" else p.status
-    val upd = (millis() - p.lastUpdateMs) / 1000
-    val right = if (!p.hasData) source else "$source · ${ago(upd.toLong())}"
-    s.textRight(w - 10, fy + 5, right, if (p.live || p.demo) METAL else RED, 1, SCREEN_BG)
-}
-
-/** Line pictogram: long-distance products filled red, regional ones outlined (timetable style). */
-fun badge(s: Screen, x: Int, y: Int, line: String) {
-    val bw = 34
-    val bh = 18
-    val longDistance = line.startsWith("IC") || line.startsWith("IR") || line.startsWith("EC") || line.startsWith("TGV")
-    if (longDistance) {
-        s.fillRect(x, y, bw, bh, RED)
-        s.textCentered(x, bw, y + 5, line, WHITE, 1, RED)
-    } else {
-        s.fillRect(x, y, bw, bh, WHITE)
-        s.drawRect(x, y, bw, bh, CHARCOAL)
-        s.textCentered(x, bw, y + 5, line, CHARCOAL, 1, WHITE)
+    private fun row(d: Departure, y: Int, separator: Boolean) {
+        val w = s.width
+        val main = if (d.cancelled) METAL else CHARCOAL
+        s.text(8, y + 6, hhmm(d.plannedMs), main, 2, SCREEN_BG)
+        val delayMin = (d.delaySec + 30) / 60
+        if (!d.cancelled && delayMin >= 1) s.text(70, y + 10, "+$delayMin'", RED, 1, SCREEN_BG)
+        badge(98, y + 6, d.line, d.category)
+        val right = w - 8
+        var avail = right - 138
+        if (d.cancelled) {
+            s.textRight(right, y + 10, "Cancelled", RED, 1, SCREEN_BG)
+            avail -= Screen.textWidth("Cancelled") + 6
+        }
+        // big letters when the destination fits, otherwise small ones (complete rather than cut)
+        if (Screen.textWidth(d.destination, 2) <= avail) s.text(138, y + 6, d.destination, main, 2, SCREEN_BG)
+        else s.text(138, y + 10, Screen.ellipsize(d.destination, avail), main, 1, SCREEN_BG)
+        if (separator) s.drawLine(8, y + ROW_H - 1, w, y + ROW_H - 1, SILVER)
     }
-}
 
-fun row(s: Screen, inc: Incident, p: Panel, y: Int, separator: Boolean) {
-    val w = s.width
-    val fresh = p.firstSeen[inc.id]?.let { millis() - it < 8000 } ?: false
-    val bg = if (fresh) MILK else SCREEN_BG
-    s.fillRect(0, y, w, ROW_H, bg)
-    if (fresh) s.fillRect(0, y, 3, ROW_H, RED)       // discreet "new" mark
-
-    badge(s, 10, y + 8, inc.line)
-
-    val tx = 54
-    val right = w - 10
-    // delay / status, right-aligned like on a departure board
-    val delay = when {
-        inc.severity == Severity.CRITICAL -> "Cancelled"
-        inc.delayMin > 0 -> "+${inc.delayMin}'"
-        else -> ""
+    /** Long-distance products filled red, regional ones outlined (timetable pictogram style). */
+    private fun badge(x: Int, y: Int, line: String, category: String) {
+        val bw = 34
+        val bh = 16
+        val text = Screen.ellipsize(line, bw - 4)
+        if (isLongDistance(category)) {
+            s.fillRect(x, y, bw, bh, RED)
+            s.textCentered(x, bw, y + 4, text, WHITE, 1, RED)
+        } else {
+            s.fillRect(x, y, bw, bh, WHITE)
+            s.drawRect(x, y, bw, bh, CHARCOAL)
+            s.textCentered(x, bw, y + 4, text, CHARCOAL, 1, WHITE)
+        }
     }
-    val dw = if (delay.isEmpty()) 0 else Screen.textWidth(delay) + 8
-    if (delay.isNotEmpty()) s.textRight(right, y + 9, delay, RED, 1, bg)
-
-    s.text(tx, y + 9, Screen.ellipsize("${inc.from} → ${inc.to}", right - tx - dw), CHARCOAL, 1, bg)
-
-    // severity: coloured dot + cause
-    s.fillCircle(tx + 2, y + 25, 2, severityColor(inc.severity))
-    s.text(tx + 9, y + 22, Screen.ellipsize(inc.cause, right - tx - 9), CHARCOAL, 1, bg)
-    s.text(tx, y + 34, Screen.ellipsize(inc.message, right - tx), GRANITE, 1, bg)
-    s.text(tx, y + 46, Screen.ellipsize("${inc.station} · ${ago(p.now() - inc.since)}", right - tx), METAL, 1, bg)
-
-    if (separator) s.drawLine(tx, y + ROW_H - 1, w, y + ROW_H - 1, SILVER)
 }
 
 fun splash(s: Screen, line1: String, line2: String) {
     s.clear(SCREEN_BG)
     s.fillRect(0, 0, s.width, HEADER_H, RED)
-    s.text(10, 7, "Disruptions", WHITE, 2, RED)
-    s.textCentered(0, s.width, 106, line1, CHARCOAL, 1, SCREEN_BG)
-    s.textCentered(0, s.width, 122, line2, METAL, 1, SCREEN_BG)
+    s.text(10, 7, "Departures", WHITE, 2, RED)
+    s.textCentered(0, s.width, 100, line1, CHARCOAL, 1, SCREEN_BG)
+    s.textCentered(0, s.width, 116, line2, METAL, 1, SCREEN_BG)
 }
 
 // ------------------------------------------------------------------ main
@@ -276,68 +351,93 @@ fun main() {
     val screen = createScreen()
     screen.clear(SCREEN_BG)
     val station = Device.config("station")
-    println("device ${Device.id}, station ${station ?: "(not set: showing all stations)"}")
-    if (DEMO) return runDemo(screen, station)
+    println("device ${Device.id}, station ${station ?: "(not set)"}")
     val sim = Board.name == "simulator"
-    val host = if (sim) "127.0.0.1" else API_HOST
-    val base = "http://$host:$API_PORT"
 
+    // 1. network and wall clock first
+    var online = sim
     if (!sim) {
         splash(screen, "Connecting to WiFi", WIFI_SSID)
-        while (!wifiConnect(WIFI_SSID, WIFI_PASSWORD, 20000)) {
-            println("WiFi: cannot connect, retrying...")
-            splash(screen, "WiFi not available", "retrying $WIFI_SSID")
+        var tries = 0
+        while (!online && (tries < 1 || !DEMO)) {   // demo mode: one try, then carry on offline
+            online = wifiConnect(WIFI_SSID, WIFI_PASSWORD, if (DEMO) 10000 else 15000)
+            tries++
+            if (!online) {
+                println("WiFi: cannot connect to $WIFI_SSID")
+                splash(screen, "WiFi not available", "retrying $WIFI_SSID")
+            }
         }
-        println("WiFi OK, IP ${wifiIp()}")
+        if (online) println("WiFi OK, IP ${wifiIp()}")
+    }
+    if (online) {
+        splash(screen, "Setting the clock", NTP_SERVER)
+        if (ntpSync(NTP_SERVER, 10000)) println("NTP: clock set from $NTP_SERVER, ${hhmm(epochMillis())} Swiss time")
+        else println("NTP: no answer from $NTP_SERVER, using the twin clock")
     }
 
-    val query = if (station != null) "?station=$station" else ""
-    val panel = Panel(station)
-    val ws = WebSocket("ws://$host:$API_PORT/ws/incidents$query")
-    var page = 0
-    var nextPageMs = millis() + 6000
+    if (station == null) {
+        splash(screen, "No station configured", "./ktesp config station=<UIC id>")
+        while (true) delay(1000)
+    }
+    if (DEMO) return runDemo(screen, station)
+
+    // 2. twin API
+    val base = (Device.config("api") ?: if (API_BASE.isNotEmpty()) API_BASE
+        else "http://${if (sim) "127.0.0.1" else MOCK_HOST}:8765").removeSuffix("/")
+    val wsUrl = (if (base.startsWith("https")) "wss" + base.substring(5) else "ws" + base.substring(4)) + "/api/v1/ws"
+    val restUrl = "$base/api/v1/stations/$station/screen?limit=$ROWS_MAX"
+    val subscribe = """{"op":"subscribe","topic":"screen","id":"$station","frequencySec":$SCREEN_FREQ_SEC,"limit":$ROWS_MAX}"""
+    println("API $base")
+
+    val board = StationBoard(station)
+    val renderer = Renderer(screen)
+    val ws = WebSocket(wsUrl)
+    var nextWsTryMs = 0
+    var nextRestMs = 0
+    var nextTickMs = millis() + 6000
     var nextRenderMs = 0
-    var nextRetryMs = 0
+    var tick = 0
     var dirty = true
 
     while (true) {
-        if (!ws.isOpen && millis() >= nextRetryMs) {
-            panel.live = false
-            panel.status = "Connecting"
-            // WebSocket first, then the snapshot: no event is lost in between
-            if (ws.connect(5000)) {
-                val body = Http.getOrNull("$base/api/incidents$query")
-                if (body != null) {
-                    panel.load(body)
-                    panel.live = true
-                    println("connected: ${panel.incidents.size} disruptions for ${panel.title}")
-                } else {
-                    ws.close()
-                }
-            }
-            if (!panel.live) {
-                panel.status = "Offline"
-                println("API not reachable ($base), retrying in 3 s")
-                nextRetryMs = millis() + 3000
+        val now = millis()
+        if (!ws.isOpen && now >= nextWsTryMs) {
+            if (ws.connect(5000) && ws.send(subscribe)) {
+                println("websocket connected")
+                board.live = true
+            } else {
+                board.live = false
+                board.status = "Offline"
+                nextWsTryMs = now + 5000
             }
             dirty = true
+        }
+        // fallback while the WebSocket is down
+        if (!ws.isOpen && now >= nextRestMs) {
+            val body = Http.getOrNull(restUrl, 8000)
+            if (body != null) {
+                try { board.onJson(body); dirty = true } catch (e: JsonException) { println("bad response: ${e.message}") }
+            } else {
+                println("API not reachable (HTTP ${httpStatus()})")
+            }
+            nextRestMs = millis() + REST_POLL_MS
         }
 
         val msg = ws.receive(200)
         if (msg != null) {
             try {
-                if (panel.apply(msg)) dirty = true
+                if (board.onJson(msg)) dirty = true
             } catch (e: JsonException) {
                 println("ignored message: ${e.message}")
             }
         }
 
-        val now = millis()
-        if (now >= nextPageMs) { page++; nextPageMs = now + 6000; dirty = true }
-        if (dirty || now >= nextRenderMs) {
-            render(screen, panel, page)
+        val t = millis()
+        if (t >= nextTickMs) { tick++; nextTickMs = t + 6000; dirty = true }
+        if (dirty || t >= nextRenderMs) {
+            renderer.render(board, tick)
             dirty = false
-            nextRenderMs = now + 5000
+            nextRenderMs = t + 1000
         }
     }
 }

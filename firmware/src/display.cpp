@@ -258,6 +258,8 @@ static int next_glyph(const uint8_t* s, size_t n, size_t* i) {
     case 0xBA: return 0xA7; case 0x20AC: return 'E'; case 0x2192: return 0x1A; case 0x2190: return 0x1B;
     case 0xC1: return 'A'; case 0xCD: return 'I'; case 0xD3: return 'O'; case 0xDA: return 'U';
     case 0x2022: return 0x07; case 0x2026: return '.';
+    case 0x2013: case 0x2014: case 0x2212: return '-'; case 0x2018: case 0x2019: return '\'';
+    case 0x201C: case 0x201D: return '"'; case 0xA0: return ' ';
     default: return '?';
   }
 }

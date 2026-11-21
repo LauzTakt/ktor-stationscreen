@@ -7,11 +7,20 @@ import esp32.screen.TftPins
 const val WIFI_SSID = "my-wifi"
 const val WIFI_PASSWORD = "my-password"
 
-/** Computer running `./ktesp screen` (mock API) or your real API. The simulator always uses 127.0.0.1. */
-const val API_HOST = "192.168.1.50"
-const val API_PORT = 8765
+/**
+ * Base URL of the twin API (REST /api/v1 + WebSocket /api/v1/ws), e.g. "https://twin.example.org".
+ * Empty = the mock API served by `./ktesp screen` on the computer (MOCK_HOST below, port 8765).
+ * The desktop simulator only speaks http:// and ws://; the ESP32 also https:// and wss://.
+ */
+const val API_BASE = ""
 
-/** true = no network: the board shows built-in sample data (see Demo.kt). */
+/** Computer running `./ktesp screen` (only used when API_BASE is empty and the program runs on the ESP32). */
+const val MOCK_HOST = "192.168.1.50"
+
+/** NTP server used at start-up to set the clock (first thing after WiFi). */
+const val NTP_SERVER = "pool.ntp.org"
+
+/** true = no API: the board shows built-in sample data (see Demo.kt); WiFi and NTP are still used if available. */
 const val DEMO = true
 
 /**

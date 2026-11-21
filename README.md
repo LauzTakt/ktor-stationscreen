@@ -40,7 +40,9 @@ fun main() {
    - a conservative mark-and-sweep GC over a heap of about 80 KB;
    - natives for `String`, the hardware, WiFi/HTTP/WebSocket and the TFT display;
    - a FreeRTOS task for the VM and a serial receiver that accepts new programs while running;
-   - the last program is stored in LittleFS and starts automatically at power-on.
+   - the last program is stored in the second app partition (`app1`, no OTA is used) and runs straight from flash
+     through the MMU, so it takes no RAM; it starts automatically at power-on;
+   - the WiFi driver is started at boot, before the Kotlin heap is allocated, so it always has the ~50 KB it needs.
 5. **`host/`** builds the same VM for the Mac (`./ktesp sim`), so you can test without a board.
 
 ## Usage
@@ -89,7 +91,8 @@ In the simulator, pass them with `--config station=8501120` (`./ktesp sim` and `
 
 | Package | API | Description |
 |---|---|---|
-| `esp32.net` | `wifiConnect`, `wifiIp`, `Http.get(url)`, `WebSocket(url)` (`connect`/`receive`/`send`/`close`) | HTTP/1.1 and WebSocket client (also `https`/`wss` on the ESP32, without certificate validation) |
+| `esp32.net` | `wifiConnect`, `wifiIp`, `ntpSync(server)`, `Http.get(url)`, `WebSocket(url)` (`connect`/`receive`/`send`/`close`) | WiFi, NTP clock, HTTP/1.1 and WebSocket client (also `https`/`wss` on the ESP32, without certificate validation); WebSocket messages too large for the board are skipped |
+| `esp32` | `epochMillis()` | UTC wall clock (after `ntpSync`), 0 if never set |
 | `esp32.json` | `Json.parseObject(text)`, `JsonObject.str/int/long/obj/arr`, `Json.stringify` | JSON without reflection |
 | `esp32.screen` | `Screen.simulated()` / `Screen.ili9341(pins)`, `fillRect`, `fillRoundRect`, `fillCircle`, `drawLine`, `text(x, y, s, color, size, bg)`, `textCentered`, `wrap`, `ellipsize`... | 320x240 ILI9341 TFT |
 
@@ -105,16 +108,25 @@ with `external fun` in Kotlin, run `python3 tools/natives.py` (regenerates `nati
 ./ktesp screen                          # just watch the program already running on the ESP32
 ```
 
-Each board serves one station, whose ID is a device setting (`./ktesp config station=8501120`). The program
-fetches the disruptions with a GET to `/api/incidents?station=ID` (which also returns the station name) and then
-listens to a WebSocket on `/ws/incidents?station=ID`. The enrichment happens on the board itself: it keeps only the
-disruptions affecting its station (each one lists the IDs of the stations it affects), colours them by severity,
-computes relative times ("12 min ago"), the worst delay and cancelled lines, sorts by severity and pages them.
-Without a station ID it shows the whole network. The result is drawn as a Swiss-style
-departure board on a 320x240 TFT: red header with the clock, white background, line pictograms, delays in red.
+`examples/trains/Trains.kt` is a station departure board. Each board serves one station, whose UIC/DIDOK ID is a
+device setting (`./ktesp config station=8501120`). At start-up it connects to WiFi, **sets its clock with NTP**
+(`NTP_SERVER` in `Config.kt`) and then talks to the twin API of `ktor_app` (`docs/API.md`):
 
-With `DEMO = true` in `Config.kt` the board needs no network: `Demo.kt` replays built-in sample disruptions
-around Lausanne through the same JSON parsing and enrichment code.
+- WebSocket `/api/v1/ws` with `{"op":"subscribe","topic":"screen","id":"8501120","limit":6}`: the server sends a
+  compact `screen_update` (station name, next departures, related incidents, about 1 KB) every 30 s and immediately
+  when an incident changes. The full API objects (stops, origins, operators...) would not fit in the board's memory,
+  so the server sends only what the screen draws.
+- `GET /api/v1/stations/{id}/screen?limit=6`: same document, polled while the WebSocket is down.
+
+The API address is `API_BASE` in `Config.kt`, or a device setting (`./ktesp config api=https://...`) that overrides
+it. Left empty, the board uses the mock API of `./ktesp screen` on the computer (`MOCK_HOST`).
+
+Enrichment on the board: Swiss local time (CET/CEST computed on the board), delay in minutes, cancelled trains, line
+pictograms (long-distance products in red), the worst incident first in a rotating banner. Drawing is incremental:
+each zone (header, banner, every row, footer) remembers what it shows and is only repainted when that changes.
+
+With `DEMO = true` in `Config.kt` the board needs no API: `Demo.kt` builds the same `screen` documents from a
+clock-face timetable around Lausanne and a scripted sequence of incidents.
 
 `./ktesp screen` (`tools/screen.py` + `tools/screen_ui.html`) is the Mac app, opened as a Chrome app window:
 - it follows the USB connection: with no ESP32 plugged in the emulated display has no power and stays black;
@@ -122,11 +134,12 @@ around Lausanne through the same JSON parsing and enrichment code.
   and it goes black again when the board is unplugged;
 - it reads the serial port (or the simulator), separates the display traffic from the console text and shows the
   emulated TFT;
-- it serves a **mock disruptions API** (GET and WebSocket) on port 8765, with buttons to create, update and
-  resolve disruptions, and lists the station IDs it knows (UIC-style numbers for stations around Lausanne).
+- it serves a **mock of the twin API v1** (`tools/mock_api.py`: stations, boards, incidents, the `screen` view and
+  the WebSocket topics `station` and `screen`) on port 8765, with buttons to create, update and resolve incidents.
+  `./ktesp screen --sim` points the simulated board at it automatically.
 
-The configuration (WiFi, address of the API, display) lives in `examples/trains/Config.kt`, which is not committed
-to git. Use `Config.kt.example` as a template.
+The configuration (WiFi, API, NTP server, display) lives in `examples/trains/Config.kt`, which is not committed to
+git. Use `Config.kt.example` as a template.
 
 ### Display: real or emulated ILI9341
 
