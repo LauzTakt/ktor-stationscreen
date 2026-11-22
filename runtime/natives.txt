@@ -119,3 +119,6 @@ esp32/Esp32Kt.deviceId()Ljava/lang/String;
 # ---- wall clock (NTP)
 esp32/net/NetKt.ntpSync(Ljava/lang/String;I)Z
 esp32/Esp32Kt.epochMillis()J
+# ---- conditional HTTP GET (ETag / If-None-Match)
+esp32/net/NetKt.httpGetIfChanged(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;
+esp32/net/NetKt.httpEtag()Ljava/lang/String;

@@ -4,25 +4,28 @@
 // every screen runs the same program image. The API address can be a device setting too (`./ktesp config api=...`),
 // overriding API_BASE in Config.kt.
 //
-// Start-up: WiFi -> NTP (wall clock) -> twin API. The data comes pre-digested for small displays from the twin API
-// (ktor_app, docs/API.md "Station screen"), about 1 KB per update:
+// Start-up: WiFi -> NTP (wall clock) -> twin API. The data comes pre-digested for microcontrollers from the twin API
+// (ktor_app, docs/API.md "Station screen, text form"), about 250 bytes of text, no JSON:
 //
-//   WS    /api/v1/ws  {"op":"subscribe","topic":"screen","id":<stopId>,"limit":N}   pushed every SCREEN_FREQ_SEC and
-//                                                                                   immediately on incident changes
-//   REST  GET /api/v1/stations/{id}/screen?limit=N                                  fallback while the WS is down
+//   GET /api/v1/stations/{id}/screen.txt?limit=N&incidents=M     every POLL_SEC, with If-None-Match: <ETag>
 //
-// Enrichment on the board: Swiss local time, delay in minutes, cancelled trains, line pictograms, rotating banner.
+//   S|Genève|04:15|1795317343                       station, Swiss local time, epoch seconds
+//   D|04:46|1|RE33|RE|Genève-Aéroport|0|0           planned HH:MM, delay min, line, category, to, cancelled, at station
+//   I|minor|0|1|RE33 to Genève-Aéroport: late|...   severity, at station, trains affected, title, where
+//
+// An unchanged board answers 304 with no body, so most polls cost a few hundred bytes of headers and no parsing.
+// Plain HTTP to an IP address: no TLS (it needs ~40 KB of RAM) and no DNS lookup.
 // Drawing is incremental: every zone remembers what it shows and is only repainted when that changes.
 package trains
 
 import esp32.*
-import esp32.json.*
 import esp32.net.*
 import esp32.screen.*
 
 const val ROWS_MAX = 6
-const val SCREEN_FREQ_SEC = 30
-const val REST_POLL_MS = 20000
+const val INCIDENTS_MAX = 3
+const val POLL_SEC = 30
+const val RETRY_SEC = 10
 
 // ------------------------------------------------------------------ model
 enum class Severity(val rank: Int) {
@@ -40,11 +43,12 @@ enum class Severity(val rank: Int) {
 
 class Departure(
     val line: String, val category: String, val destination: String,
-    val plannedMs: Long, val delaySec: Int, val cancelled: Boolean, val atStation: Boolean,
+    /** Planned departure, Swiss local "HH:MM" (from the server). */
+    val planned: String, val delayMin: Int, val cancelled: Boolean, val atStation: Boolean,
 )
 
 class Incident(
-    val id: String, val title: String, val where: String, val severity: Severity,
+    val title: String, val where: String, val severity: Severity,
     /** true = at the station itself; false = it only affects trains that will call here. */
     val atStation: Boolean, val trains: Int,
 )
@@ -118,39 +122,51 @@ class StationBoard(val stationId: String) {
         return if (wall > 0) wall else twinOffsetMs + millis()
     }
 
-    /** A `Screen` document (REST body), or a WebSocket message (`screen_update` carries it in `data`). */
-    fun onJson(json: String): Boolean {
-        val m = Json.parseObject(json)
-        val type = m.strOrNull("type")
-        if (type == null) { load(m); return true }
-        when (type) {
-            "screen_update" -> { load(m.obj("data") ?: return false); return true }
-            "subscribed" -> println("subscribed to screen ${m.str("id")}")
-            "error" -> println("api error ${m.str("code")}: ${m.str("message")}")
-        }
-        return false
-    }
-
-    private fun load(s: JsonObject) {
-        val now = s.long("now")
-        if (now > 0) twinOffsetMs = now - millis()
-        s.strOrNull("name")?.let { stationName = it }
+    /** A `screen.txt` body: one item per line, `|`-separated fields (see the top of this file). */
+    fun load(text: String) {
         val deps = ArrayList<Departure>()
-        for (d in s.arr("departures").objects()) {
-            val line = d.str("line", "?")
-            deps.add(Departure(line, d.str("category", line), d.str("to", "?"), d.long("plannedTime"),
-                d.int("delaySec"), d.bool("cancelled"), d.bool("atStation")))
-        }
         val incs = ArrayList<Incident>()
-        for (i in s.arr("incidents").objects()) {
-            incs.add(Incident(i.str("id"), i.str("title"), i.str("where"), Severity.of(i.strOrNull("severity")),
-                i.bool("atStation"), i.int("trains")))
+        var start = 0
+        while (start < text.length) {
+            var end = text.indexOf('\n', start)
+            if (end < 0) end = text.length
+            val f = fields(text, start, end)
+            when (f[0]) {
+                "S" -> if (f.size >= 4) {
+                    stationName = f[1]
+                    val now = f[3].toLongOrNull() ?: 0L
+                    if (now > 0) twinOffsetMs = now * 1000 - millis()
+                }
+                "D" -> if (f.size >= 8) deps.add(Departure(f[3], f[4], f[5], f[1], f[2].toIntOrNull() ?: 0,
+                    f[6] == "1", f[7] == "1"))
+                "I" -> if (f.size >= 6) incs.add(Incident(f[4], f[5], Severity.of(f[1]), f[2] == "1",
+                    f[3].toIntOrNull() ?: 0))
+            }
+            start = end + 1
         }
         if (incs.size != incidents.size) println("${incs.size} incident(s), ${deps.size} departures at $title")
         departures = deps
         incidents = incs   // already sorted worst first by the server
+        touch()
+    }
+
+    /** The server confirmed the board is unchanged (304). */
+    fun touch() {
         lastUpdateMs = millis()
         hasData = true
+    }
+}
+
+/** Splits text[start, end) on '|'. */
+fun fields(text: String, start: Int, end: Int): ArrayList<String> {
+    val out = ArrayList<String>(8)
+    var i = start
+    while (true) {
+        var j = text.indexOf('|', i)
+        if (j < 0 || j > end) j = end
+        out.add(text.substring(i, j))
+        if (j >= end) return out
+        i = j + 1
     }
 }
 
@@ -232,7 +248,7 @@ class Renderer(val s: Screen) {
             val n = b.incidents.size
             val inc = b.incidents[tick % n]
             val counter = if (n > 1) "${tick % n + 1}/$n" else ""
-            val bk = "${inc.id}|${inc.severity}|${inc.title}|${inc.trains}|$counter"
+            val bk = "${inc.severity}|${inc.title}|${inc.trains}|$counter"
             if (bk != bannerKey) {
                 bannerKey = bk
                 val y = HEADER_H
@@ -275,7 +291,7 @@ class Renderer(val s: Screen) {
                 val d = if (i < b.departures.size) b.departures[i] else null
                 val sep = d != null && i < b.departures.size - 1 && i < rows - 1
                 val key = if (d == null) "" else
-                    "${d.plannedMs}|${(d.delaySec + 30) / 60}|${d.line}|${d.category}|${d.destination}|${d.cancelled}|$sep"
+                    "${d.planned}|${d.delayMin}|${d.line}|${d.category}|${d.destination}|${d.cancelled}|$sep"
                 if (key != rowKeys[i]) {
                     rowKeys[i] = key
                     val y = top + i * ROW_H
@@ -306,9 +322,8 @@ class Renderer(val s: Screen) {
     private fun row(d: Departure, y: Int, separator: Boolean) {
         val w = s.width
         val main = if (d.cancelled) METAL else CHARCOAL
-        s.text(8, y + 6, hhmm(d.plannedMs), main, 2, SCREEN_BG)
-        val delayMin = (d.delaySec + 30) / 60
-        if (!d.cancelled && delayMin >= 1) s.text(70, y + 10, "+$delayMin'", RED, 1, SCREEN_BG)
+        s.text(8, y + 6, d.planned, main, 2, SCREEN_BG)
+        if (!d.cancelled && d.delayMin >= 1) s.text(70, y + 10, "+${d.delayMin}'", RED, 1, SCREEN_BG)
         badge(98, y + 6, d.line, d.category)
         val right = w - 8
         var avail = right - 138
@@ -346,12 +361,22 @@ fun splash(s: Screen, line1: String, line2: String) {
     s.textCentered(0, s.width, 116, line2, METAL, 1, SCREEN_BG)
 }
 
+/** The time just set by NTP, large, while the first departures are fetched. */
+fun showClock(s: Screen) {
+    s.clear(SCREEN_BG)
+    s.fillRect(0, 0, s.width, HEADER_H, RED)
+    s.text(10, 7, "Departures", WHITE, 2, RED)
+    s.textCentered(0, s.width, 90, hhmm(epochMillis()), CHARCOAL, 6, SCREEN_BG)
+    s.textCentered(0, s.width, 150, "Swiss time, set by NTP", METAL, 1, SCREEN_BG)
+    s.textCentered(0, s.width, 166, "Loading departures...", METAL, 1, SCREEN_BG)
+}
+
 // ------------------------------------------------------------------ main
 fun main() {
     val screen = createScreen()
     screen.clear(SCREEN_BG)
-    val station = Device.config("station")
-    println("device ${Device.id}, station ${station ?: "(not set)"}")
+    val station = Device.config("station") ?: DEFAULT_STATION
+    println("device ${Device.id}, station $station")
     val sim = Board.name == "simulator"
 
     // 1. network and wall clock first
@@ -371,67 +396,41 @@ fun main() {
     }
     if (online) {
         splash(screen, "Setting the clock", NTP_SERVER)
-        if (ntpSync(NTP_SERVER, 10000)) println("NTP: clock set from $NTP_SERVER, ${hhmm(epochMillis())} Swiss time")
-        else println("NTP: no answer from $NTP_SERVER, using the twin clock")
+        if (ntpSync(NTP_SERVER, 10000)) {
+            println("NTP: clock set from $NTP_SERVER, ${hhmm(epochMillis())} Swiss time")
+            showClock(screen)
+        } else println("NTP: no answer from $NTP_SERVER, using the twin clock")
     }
 
-    if (station == null) {
-        splash(screen, "No station configured", "./ktesp config station=<UIC id>")
-        while (true) delay(1000)
-    }
     if (DEMO) return runDemo(screen, station)
 
     // 2. twin API
     val base = (Device.config("api") ?: if (API_BASE.isNotEmpty()) API_BASE
         else "http://${if (sim) "127.0.0.1" else MOCK_HOST}:8765").removeSuffix("/")
-    val wsUrl = (if (base.startsWith("https")) "wss" + base.substring(5) else "ws" + base.substring(4)) + "/api/v1/ws"
-    val restUrl = "$base/api/v1/stations/$station/screen?limit=$ROWS_MAX"
-    val subscribe = """{"op":"subscribe","topic":"screen","id":"$station","frequencySec":$SCREEN_FREQ_SEC,"limit":$ROWS_MAX}"""
-    println("API $base")
+    val feed = ConditionalGet("$base/api/v1/stations/$station/screen.txt?limit=$ROWS_MAX&incidents=$INCIDENTS_MAX")
+    println("API ${feed.url}")
 
     val board = StationBoard(station)
     val renderer = Renderer(screen)
-    val ws = WebSocket(wsUrl)
-    var nextWsTryMs = 0
-    var nextRestMs = 0
+    var nextPollMs = 0
     var nextTickMs = millis() + 6000
     var nextRenderMs = 0
     var tick = 0
     var dirty = true
 
     while (true) {
-        val now = millis()
-        if (!ws.isOpen && now >= nextWsTryMs) {
-            if (ws.connect(5000) && ws.send(subscribe)) {
-                println("websocket connected")
-                board.live = true
-            } else {
-                board.live = false
-                board.status = "Offline"
-                nextWsTryMs = now + 5000
-            }
+        if (millis() >= nextPollMs) {
+            val body = feed.poll(8000)
+            val ok = body != null || feed.status == 304
+            if (body != null) board.load(body)
+            else if (ok) board.touch()
+            else println("API not reachable (HTTP ${feed.status})")
+            if (ok != board.live) println(if (ok) "API online" else "API offline")
+            board.live = ok
+            board.status = if (ok) "Live" else "Offline"
+            nextPollMs = millis() + (if (ok) POLL_SEC else RETRY_SEC) * 1000
             dirty = true
         }
-        // fallback while the WebSocket is down
-        if (!ws.isOpen && now >= nextRestMs) {
-            val body = Http.getOrNull(restUrl, 8000)
-            if (body != null) {
-                try { board.onJson(body); dirty = true } catch (e: JsonException) { println("bad response: ${e.message}") }
-            } else {
-                println("API not reachable (HTTP ${httpStatus()})")
-            }
-            nextRestMs = millis() + REST_POLL_MS
-        }
-
-        val msg = ws.receive(200)
-        if (msg != null) {
-            try {
-                if (board.onJson(msg)) dirty = true
-            } catch (e: JsonException) {
-                println("ignored message: ${e.message}")
-            }
-        }
-
         val t = millis()
         if (t >= nextTickMs) { tick++; nextTickMs = t + 6000; dirty = true }
         if (dirty || t >= nextRenderMs) {
@@ -439,5 +438,6 @@ fun main() {
             dirty = false
             nextRenderMs = t + 1000
         }
+        delay(100)
     }
 }

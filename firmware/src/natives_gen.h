@@ -112,7 +112,9 @@ enum NativeId {
   N_esp32_Esp32Kt_deviceId_Ljava_lang_String = 106,
   N_esp32_net_NetKt_ntpSync_Ljava_lang_String_I_Z = 107,
   N_esp32_Esp32Kt_epochMillis_J = 108,
-  N_COUNT = 109
+  N_esp32_net_NetKt_httpGetIfChanged_Ljava_lang_String_Ljava_lang_String_I_Ljava_lang_String = 109,
+  N_esp32_net_NetKt_httpEtag_Ljava_lang_String = 110,
+  N_COUNT = 111
 };
 
 static const uint8_t native_argslots[] = {
@@ -225,6 +227,8 @@ static const uint8_t native_argslots[] = {
   0, // esp32/Esp32Kt.deviceId()Ljava/lang/String;
   2, // esp32/net/NetKt.ntpSync(Ljava/lang/String;I)Z
   0, // esp32/Esp32Kt.epochMillis()J
+  3, // esp32/net/NetKt.httpGetIfChanged(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;
+  0, // esp32/net/NetKt.httpEtag()Ljava/lang/String;
 };
 static const uint8_t native_retslots[] = {
   0,
@@ -336,6 +340,8 @@ static const uint8_t native_retslots[] = {
   1,
   1,
   2,
+  1,
+  1,
 };
 static const char* const native_names[] = {
   "java/lang/Object.<init>()V",
@@ -447,4 +453,6 @@ static const char* const native_names[] = {
   "esp32/Esp32Kt.deviceId()Ljava/lang/String;",
   "esp32/net/NetKt.ntpSync(Ljava/lang/String;I)Z",
   "esp32/Esp32Kt.epochMillis()J",
+  "esp32/net/NetKt.httpGetIfChanged(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;",
+  "esp32/net/NetKt.httpEtag()Ljava/lang/String;",
 };

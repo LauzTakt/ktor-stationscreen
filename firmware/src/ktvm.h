@@ -6,6 +6,8 @@
 enum { ST_OK = 0, ST_EXC = 1, ST_ABORT = 2, ST_FATAL = 3 };
 
 // Load an image (the buffer must stay alive until vm_unload). heap_bytes = size of the GC heap.
+// Bytes of the largest free block that vm_load leaves outside the heap (0 = none).
+extern uint32_t vm_heap_reserve;
 bool vm_load(const uint8_t* img, size_t len, uint32_t heap_bytes, char* err, size_t errlen);
 int vm_run();  // run main(); prints uncaught exceptions; returns ST_*
 void vm_unload();

@@ -1,5 +1,5 @@
-// Offline mode: no API. The board builds the same compact `Screen` documents the twin API sends
-// (docs/API.md "Station screen") from a clock-face timetable and a scripted sequence of incidents, and feeds them
+// Offline mode: no API. The board builds the same `screen.txt` documents the twin API sends
+// (docs/API.md "Station screen, text form") from a clock-face timetable and a scripted sequence of incidents, and feeds them
 // through the same parsing, enrichment and drawing code.
 package trains
 
@@ -36,8 +36,8 @@ private class DemoApi(val stationId: String) {
 
     fun screen(limit: Int): String {
         val sb = StringBuilder()
-        sb.append("""{"stopId":"$stationId","name":"${STATION_NAMES[stationId] ?: "Station $stationId"}",""")
-        sb.append(""""now":$nowMs,"departures":[""")
+        sb.append("S|").append(STATION_NAMES[stationId] ?: "Station $stationId").append('|').append(hhmm(nowMs))
+            .append('|').append(nowMs / 1000).append('\n')
         val hourMs = 3600000L
         var hour = (nowMs / hourMs) * hourMs - hourMs
         var n = 0
@@ -52,22 +52,17 @@ private class DemoApi(val stationId: String) {
                     cancelled = cancelled || inc.cancels
                 }
                 if (planned + delay * 1000L < nowMs - 60000) continue
-                if (n > 0) sb.append(',')
-                sb.append("""{"plannedTime":$planned,"delaySec":$delay,"line":"${sv.line}","category":"${sv.category}",""")
-                sb.append(""""to":"${sv.destination}","cancelled":$cancelled,"atStation":false}""")
+                sb.append("D|").append(hhmm(planned)).append('|').append(delay / 60).append('|').append(sv.line)
+                    .append('|').append(sv.category).append('|').append(sv.destination)
+                    .append(if (cancelled) "|1|0\n" else "|0|0\n")
                 n++
             }
             hour += hourMs
         }
-        sb.append("""],"incidents":[""")
-        val sorted = incidents.values.sortedBy { rank(it.severity) }
-        for (i in sorted.indices) {
-            val inc = sorted[i]
-            if (i > 0) sb.append(',')
-            sb.append("""{"id":"${inc.id}","severity":"${inc.severity}","title":"${inc.title}","where":"${inc.where}",""")
-            sb.append(""""atStation":${inc.atStation},"trains":${inc.trains},"updatedAt":$nowMs}""")
+        for (inc in incidents.values.sortedBy { rank(it.severity) }) {
+            sb.append("I|").append(inc.severity).append(if (inc.atStation) "|1|" else "|0|").append(inc.trains)
+                .append('|').append(inc.title).append('|').append(inc.where).append('\n')
         }
-        sb.append("]}")
         return sb.toString()
     }
 
@@ -105,12 +100,12 @@ fun runDemo(screen: Screen, stationId: String) {
     val start = esp32.millis()
     val clockStart = if (esp32.epochMillis() > 0) esp32.epochMillis() else T0
     api.nowMs = clockStart
-    board.onJson(api.screen(ROWS_MAX))
+    board.load(api.screen(ROWS_MAX))
     println("demo: ${board.departures.size} departures at ${board.title} (no API)")
 
     var step = 0
     var nextStepMs = start + SCRIPT[0].afterSec * 1000
-    var nextUpdateMs = start + SCREEN_FREQ_SEC * 1000
+    var nextUpdateMs = start + POLL_SEC * 1000
     var nextTickMs = start + 6000
     var nextRenderMs = 0
     var tick = 0
@@ -126,8 +121,8 @@ fun runDemo(screen: Screen, stationId: String) {
             update = true
         }
         if (update) {
-            board.onJson(api.screen(ROWS_MAX))
-            nextUpdateMs = now + SCREEN_FREQ_SEC * 1000
+            board.load(api.screen(ROWS_MAX))
+            nextUpdateMs = now + POLL_SEC * 1000
             dirty = true
         }
         if (now >= nextTickMs) { tick++; nextTickMs = now + 6000; dirty = true }

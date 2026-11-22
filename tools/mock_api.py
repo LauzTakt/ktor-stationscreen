@@ -5,6 +5,7 @@ Only what a station screen needs, with the same shapes and rules as the real API
     GET /api/v1/stations[?q=&limit=]           GET /api/v1/stations/{stopId}
     GET /api/v1/stations/{stopId}/board?type=departures|arrivals|all&windowMin=&limit=&includeSkipped=
     GET /api/v1/stations/{stopId}/incidents    GET /api/v1/stations/{stopId}/screen?limit=&windowMin=
+    GET /api/v1/stations/{stopId}/screen.txt?limit=&windowMin=&incidents=
     GET /api/v1/incidents[?all=&severity=&scopeKind=]
     GET /api/v1/incidents/{id}
     WS  /api/v1/ws   {"op":"subscribe","topic":"station"|"screen","id":...,"frequencySec":..,"windowMin":..,"limit":..}
@@ -18,6 +19,8 @@ import json
 import random
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # UIC / DIDOK stop ids
 STATIONS = {
@@ -51,6 +54,14 @@ SEVERITIES = ["info", "minor", "major", "critical"]
 def _stable(s, n):
     return int(hashlib.md5(s.encode()).hexdigest()[:8], 16) % n
 
+
+
+class Text(str):
+    """A text/plain API response with an ETag (served by tools/screen.py, 304 on If-None-Match)."""
+    def __new__(cls, body, etag):
+        s = super().__new__(cls, body)
+        s.etag = etag
+        return s
 
 class MockTwinApi:
     def __init__(self, log=lambda m: None):
@@ -149,6 +160,22 @@ class MockTwinApi:
         entries.sort(key=lambda e: (not e["atStation"], e["time"]))
         return {"station": self.station(stop_id), "type": typ, "now": now, "windowMin": window_min,
                 "entries": entries[:limit]}
+
+    def screen_text(self, stop_id, limit=6, window_min=120, incidents=3):
+        """Text form of the screen view for microcontrollers (docs/API.md, "Station screen, text form")."""
+        s = self.screen(stop_id, limit, window_min)
+        zone = ZoneInfo("Europe/Zurich")
+        hhmm = lambda ms: datetime.fromtimestamp(ms / 1000, zone).strftime("%H:%M")
+        f = lambda v, n: str(v or "").replace("|", "/").replace("\n", " ").strip()[:n]
+        lines = [f"D|{hhmm(d['plannedTime']) if d['plannedTime'] else '--:--'}|{max(0, d['delaySec']) // 60}|"
+                 f"{f(d['line'], 12)}|{f(d['category'], 8)}|{f(d['to'], 40)}|{int(d['cancelled'])}|{int(d['atStation'])}"
+                 for d in s["departures"]]
+        lines += [f"I|{i['severity'] or 'info'}|{int(i['atStation'])}|{i['trains']}|{f(i['title'], 96)}|{f(i['where'], 48)}"
+                  for i in s["incidents"][:incidents]]
+        content = "".join(l + "\n" for l in lines)
+        name = f(s["name"], 40)
+        etag = '"' + hashlib.sha1(f"{name}\n{content}".encode()).hexdigest()[:12] + '"'
+        return Text(f"S|{name}|{hhmm(s['now'])}|{s['now'] // 1000}\n{content}", etag)
 
     def screen(self, stop_id, limit=6, window_min=120):
         """Compact view for small displays (docs/API.md, "Station screen")."""
@@ -325,6 +352,9 @@ class MockTwinApi:
                             return err("bad_type", "type must be departures, arrivals or all", 400)
                         return 200, self.board(sid, typ, intp("windowMin", 120, 1, 1440), intp("limit", 50, 1, 500),
                                                q.get("includeSkipped", "true") != "false")
+                    if parts[2:] == ["screen.txt"]:
+                        return 200, self.screen_text(sid, intp("limit", 6, 1, 20), intp("windowMin", 120, 1, 1440),
+                                                     intp("incidents", 3, 0, 5))
                     if parts[2:] == ["screen"]:
                         return 200, self.screen(sid, intp("limit", 6, 1, 20), intp("windowMin", 120, 1, 1440))
                     if parts[2:] == ["incidents"]:

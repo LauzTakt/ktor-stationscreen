@@ -474,6 +474,17 @@ int native_call(uint16_t nid, uint32_t* a) {
       return st;
     }
     case N_esp32_net_NetKt_httpStatus_I: a[0] = (uint32_t)g_http_status; return ST_OK;
+    case N_esp32_net_NetKt_httpGetIfChanged_Ljava_lang_String_Ljava_lang_String_I_Ljava_lang_String: {
+      NEED_STR(a[0], "httpGetIfChanged(url)");
+      NEED_STR(a[1], "httpGetIfChanged(etag)");
+      size_t n;
+      char* body = net_http_get(str_chars(a[0]), (int32_t)a[2], &n, &g_http_status, str_chars(a[1]));
+      if (!body) { a[0] = 0; return vm_abort_flag ? ST_ABORT : ST_OK; }
+      int st = ret_str(a, body, n);
+      free(body);
+      return st;
+    }
+    case N_esp32_net_NetKt_httpEtag_Ljava_lang_String: return ret_cstr(a, net_last_etag());
     case N_esp32_net_NetKt_wsOpen_Ljava_lang_String_I_I:
       NEED_STR(a[0], "wsOpen(url)");
       a[0] = (uint32_t)net_ws_open(str_chars(a[0]), (int32_t)a[1]);

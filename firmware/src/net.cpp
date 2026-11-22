@@ -102,16 +102,21 @@ static int status_of(const Buf* b) {
 }
 
 // ---------------------------------------------------------------- HTTP GET
-char* net_http_get(const char* url, int timeout_ms, size_t* len, int* status) {
-  *status = -1; *len = 0;
+static char g_etag[64];
+const char* net_last_etag() { return g_etag; }
+
+char* net_http_get(const char* url, int timeout_ms, size_t* len, int* status, const char* if_none_match) {
+  *status = -1; *len = 0; g_etag[0] = 0;
   Url u;
   if (!parse_url(url, &u)) return nullptr;
   int h = hal_tcp_connect(u.host, u.port, u.tls, timeout_ms);
   if (h < 0) { set_err("cannot connect"); return nullptr; }
   char req[512];
-  int rl = snprintf(req, sizeof req,
-                    "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ktvm\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-                    u.path, u.host);
+  int rl = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n%s%s%s\r\n", u.path, u.host,
+                    if_none_match && *if_none_match ? "If-None-Match: " : "",
+                    if_none_match && *if_none_match ? if_none_match : "",
+                    if_none_match && *if_none_match ? "\r\n" : "");
+  if (rl >= (int)sizeof req) { set_err("url too long"); hal_tcp_close(h); return nullptr; }
   Buf b, body;
   char* out = nullptr;
   if (!write_all(h, (const uint8_t*)req, rl)) { set_err("write failed"); goto done; }
@@ -124,6 +129,13 @@ char* net_http_get(const char* url, int timeout_ms, size_t* len, int* status) {
     bool chunked = te && !strncasecmp(te, "chunked", 7);
     const char* cl = header_value((const char*)b.d, "Content-Length");
     long want = cl ? atol(cl) : -1;
+    if (*status == 304 || *status == 204) want = 0;   // no body
+    const char* et = header_value((const char*)b.d, "ETag");
+    if (et) {
+      size_t n = strcspn(et, "\r\n");
+      if (n >= sizeof g_etag) n = sizeof g_etag - 1;
+      memcpy(g_etag, et, n); g_etag[n] = 0;
+    }
     buf_drop(&b, he + 4);
     // read the rest of the response (Connection: close) into b
     uint32_t t0 = hal_millis();

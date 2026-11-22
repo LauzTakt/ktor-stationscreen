@@ -42,7 +42,8 @@ fun main() {
    - a FreeRTOS task for the VM and a serial receiver that accepts new programs while running;
    - the last program is stored in the second app partition (`app1`, no OTA is used) and runs straight from flash
      through the MMU, so it takes no RAM; it starts automatically at power-on;
-   - the WiFi driver is started at boot, before the Kotlin heap is allocated, so it always has the ~50 KB it needs.
+   - the WiFi driver is started at boot, before the Kotlin heap is allocated, so it always has the ~50 KB it needs;
+   - https/wss need ~40 KB more (TLS), which is only kept free when the firmware is built with `TLS_RESERVE`.
 5. **`host/`** builds the same VM for the Mac (`./ktesp sim`), so you can test without a board.
 
 ## Usage
@@ -91,7 +92,7 @@ In the simulator, pass them with `--config station=8501120` (`./ktesp sim` and `
 
 | Package | API | Description |
 |---|---|---|
-| `esp32.net` | `wifiConnect`, `wifiIp`, `ntpSync(server)`, `Http.get(url)`, `WebSocket(url)` (`connect`/`receive`/`send`/`close`) | WiFi, NTP clock, HTTP/1.1 and WebSocket client (also `https`/`wss` on the ESP32, without certificate validation); WebSocket messages too large for the board are skipped |
+| `esp32.net` | `wifiConnect`, `wifiIp`, `ntpSync(server)`, `Http.get(url)`, `ConditionalGet(url).poll()` (ETag, 304), `WebSocket(url)` (`connect`/`receive`/`send`/`close`) | WiFi, NTP clock, HTTP/1.1 and WebSocket client (also `https`/`wss` on the ESP32, without certificate validation); WebSocket messages too large for the board are skipped |
 | `esp32` | `epochMillis()` | UTC wall clock (after `ntpSync`), 0 if never set |
 | `esp32.json` | `Json.parseObject(text)`, `JsonObject.str/int/long/obj/arr`, `Json.stringify` | JSON without reflection |
 | `esp32.screen` | `Screen.simulated()` / `Screen.ili9341(pins)`, `fillRect`, `fillRoundRect`, `fillCircle`, `drawLine`, `text(x, y, s, color, size, bg)`, `textCentered`, `wrap`, `ellipsize`... | 320x240 ILI9341 TFT |
@@ -109,23 +110,33 @@ with `external fun` in Kotlin, run `python3 tools/natives.py` (regenerates `nati
 ```
 
 `examples/trains/Trains.kt` is a station departure board. Each board serves one station, whose UIC/DIDOK ID is a
-device setting (`./ktesp config station=8501120`). At start-up it connects to WiFi, **sets its clock with NTP**
-(`NTP_SERVER` in `Config.kt`) and then talks to the twin API of `ktor_app` (`docs/API.md`):
+device setting (`./ktesp config station=8501008`; without it, `DEFAULT_STATION` in `Config.kt`). At start-up it
+connects to WiFi, **sets its clock with NTP** (`NTP_SERVER` in `Config.kt`, an IP address) and then polls the twin API
+of `ktor_app` (`docs/API.md`, "Station screen, text form"):
 
-- WebSocket `/api/v1/ws` with `{"op":"subscribe","topic":"screen","id":"8501120","limit":6}`: the server sends a
-  compact `screen_update` (station name, next departures, related incidents, about 1 KB) every 30 s and immediately
-  when an incident changes. The full API objects (stops, origins, operators...) would not fit in the board's memory,
-  so the server sends only what the screen draws.
-- `GET /api/v1/stations/{id}/screen?limit=6`: same document, polled while the WebSocket is down.
+```
+GET /api/v1/stations/8501008/screen.txt?limit=6&incidents=3      every 30 s, with If-None-Match: <ETag>
 
-The API address is `API_BASE` in `Config.kt`, or a device setting (`./ktesp config api=https://...`) that overrides
-it. Left empty, the board uses the mock API of `./ktesp screen` on the computer (`MOCK_HOST`).
+S|Genève|04:23|1795317787                    station, Swiss local time, epoch seconds
+D|04:46|0|RE33|RE|Genève-Aéroport|0|0        planned time, delay (min), line, category, destination, cancelled, at station
+I|minor|0|1|RE33 to Genève-Aéroport: late|…  severity, at the station, trains affected, title, where
+```
 
-Enrichment on the board: Swiss local time (CET/CEST computed on the board), delay in minutes, cancelled trains, line
+The server sends only what the screen draws, as text (about 100-300 bytes, no JSON parser on the board), and an
+unchanged board answers 304 with no body. Every byte of RAM counts on the board:
+- plain `http://` to an IP address (`API_BASE`): TLS would need ~40 KB of contiguous RAM next to the Kotlin heap, and
+  the IP avoids the DNS lookup;
+- one short HTTP request per poll, no WebSocket; the program image is 33 KB and runs from flash;
+- the firmware keeps no RAM for TLS by default (`TLS_RESERVE`, build with `-DTLS_RESERVE=28672` for https programs).
+
+The API address can also be a device setting (`./ktesp config api=http://...`) that overrides `API_BASE`. Left
+empty, the board uses the mock API of `./ktesp screen` on the computer (`MOCK_HOST`).
+
+Enrichment on the board: Swiss local time (for the clock; departure times come ready from the server), delay in minutes, cancelled trains, line
 pictograms (long-distance products in red), the worst incident first in a rotating banner. Drawing is incremental:
 each zone (header, banner, every row, footer) remembers what it shows and is only repainted when that changes.
 
-With `DEMO = true` in `Config.kt` the board needs no API: `Demo.kt` builds the same `screen` documents from a
+With `DEMO = true` in `Config.kt` the board needs no API: `Demo.kt` builds the same `screen.txt` documents from a
 clock-face timetable around Lausanne and a scripted sequence of incidents.
 
 `./ktesp screen` (`tools/screen.py` + `tools/screen_ui.html`) is the Mac app, opened as a Chrome app window:
@@ -134,8 +145,8 @@ clock-face timetable around Lausanne and a scripted sequence of incidents.
   and it goes black again when the board is unplugged;
 - it reads the serial port (or the simulator), separates the display traffic from the console text and shows the
   emulated TFT;
-- it serves a **mock of the twin API v1** (`tools/mock_api.py`: stations, boards, incidents, the `screen` view and
-  the WebSocket topics `station` and `screen`) on port 8765, with buttons to create, update and resolve incidents.
+- it serves a **mock of the twin API v1** (`tools/mock_api.py`: stations, boards, incidents, the `screen` and
+  `screen.txt` views and the WebSocket topics `station` and `screen`) on port 8765, with buttons to create, update and resolve incidents.
   `./ktesp screen --sim` points the simulated board at it automatically.
 
 The configuration (WiFi, API, NTP server, display) lives in `examples/trains/Config.kt`, which is not committed to

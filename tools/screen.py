@@ -28,7 +28,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from mock_api import MockTwinApi, WsSession
+from mock_api import MockTwinApi, Text, WsSession
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "screen_ui.html")
@@ -691,6 +691,15 @@ def make_handler(app):
             self.end_headers()
             self.wfile.write(body)
 
+        def _text(self, obj, unchanged):
+            body = b"" if unchanged else obj.encode()
+            self.send_response(304 if unchanged else 200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("ETag", obj.etag)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             path = self.path.split("?")[0]
             if path == "/":
@@ -706,7 +715,10 @@ def make_handler(app):
                 self._websocket()
             elif path.startswith("/api/v1/"):
                 code, obj = app.api.get(path, parse_qs(urlparse(self.path).query))
-                self._json(obj, code)
+                if isinstance(obj, Text):
+                    self._text(obj, self.headers.get("If-None-Match") == obj.etag)
+                else:
+                    self._json(obj, code)
             elif path == "/api/info":
                 self._json({"source": app.source.label, "lanIp": lan_ip(), "port": app.port,
                             "auto": app.api.auto, "ws": len(app.api.sessions), **app.hub.stats})

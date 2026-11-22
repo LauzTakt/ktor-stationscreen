@@ -26,6 +26,12 @@
 #define CONFIG_PATH "/config.txt"
 #define MAX_IMAGE (512 * 1024)
 #define VM_STACK_BYTES (40 * 1024)
+// Bytes of the largest free RAM block kept outside the Kotlin heap for TLS (https/wss). A TLS connection needs one
+// ~17 KB contiguous block plus ~15 KB during the handshake. 0 = plain http only, the whole heap for Kotlin;
+// build with -DTLS_RESERVE=28672 for programs that need https.
+#ifndef TLS_RESERVE
+#define TLS_RESERVE 0
+#endif
 #ifndef KTVM_MAX_HEAP
 #define KTVM_MAX_HEAP (80 * 1024)
 #endif
@@ -102,7 +108,13 @@ int hal_tcp_connect(const char* host, int port, bool tls, int timeout_ms) {
   } else {
     c = new WiFiClient();
   }
-  if (!c->connect(host, port, timeout_ms)) { delete c; return -1; }
+  if (!c->connect(host, port, timeout_ms)) {
+    char e[96] = "";
+    if (tls) ((WiFiClientSecure*)c)->lastError(e, sizeof e);
+    Serial.printf("[net] connect %s:%d failed%s%s (free %u B, largest block %u B)\n", host, port, tls ? ", TLS: " : "",
+                  e, (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    delete c; return -1;
+  }
   c->setNoDelay(true);
   g_sock[h] = c;
   return h;
@@ -389,11 +401,14 @@ static void run_image(const uint8_t* img, size_t len) {
   char err[96];
   vm_abort_flag = false;
   g_state = VM_RUNNING;
-  // Leave room outside the Kotlin heap for the WiFi stack and TLS (vm_load shrinks it if it doesn't fit).
-  if (!vm_load(img, len, KTVM_MAX_HEAP, err, sizeof err)) {
+  // The WiFi stack already has its memory (started at boot); optionally keep room for TLS (see TLS_RESERVE).
+  vm_heap_reserve = TLS_RESERVE;
+  bool loaded = vm_load(img, len, KTVM_MAX_HEAP, err, sizeof err);
+  if (!loaded) {
     Serial.printf("\n[ktvm] load error: %s\n", err);
   } else {
-    Serial.printf("[ktvm] running (image %u B, heap %u B)\n", (unsigned)len, (unsigned)vm_heap_free());
+    Serial.printf("[ktvm] running (image %u B, heap %u B, free RAM %u B, largest block %u B)\n", (unsigned)len,
+                  (unsigned)vm_heap_free(), (unsigned)ESP.getFreeHeap(), (unsigned)hal_largest_free_block());
     uint32_t t0 = millis();
     int st = vm_run();
     net_reset();

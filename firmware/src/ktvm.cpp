@@ -776,6 +776,8 @@ void vm_unload() {
   memset(&vm, 0, sizeof vm);
 }
 
+uint32_t vm_heap_reserve = 0;
+
 bool vm_load(const uint8_t* img, size_t len, uint32_t heap_bytes, char* err, size_t errlen) {
   vm_unload();
   Reader r{img, img + len, false};
@@ -840,6 +842,11 @@ bool vm_load(const uint8_t* img, size_t len, uint32_t heap_bytes, char* err, siz
     heap_bytes = big > 12288 ? big - 8192 : 0;
     if (heap_bytes > 256 * 1024) heap_bytes = 256 * 1024;
   }
+  if (vm_heap_reserve) {   // keep that much of the largest free block outside the heap (e.g. for TLS buffers)
+    uint32_t big = hal_largest_free_block();
+    uint32_t cap = big > vm_heap_reserve + 16384 ? big - vm_heap_reserve : 16384;
+    if (heap_bytes > cap) heap_bytes = cap;
+  }
   for (;;) {
     heap_bytes &= ~7u;
     if (heap_bytes < 4096) FAIL("out of memory (heap)");
@@ -850,7 +857,7 @@ bool vm_load(const uint8_t* img, size_t len, uint32_t heap_bytes, char* err, siz
       free(vm.heap);
       vm.heap = nullptr;
     }
-    heap_bytes -= heap_bytes / 8;
+    heap_bytes -= 4096;
   }
   vm.heap_size = heap_bytes;
   memset(vm.heap, 0, 8);

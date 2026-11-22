@@ -15,8 +15,15 @@ external fun httpGet(url: String, timeoutMs: Int): String?
 external fun ntpSync(server: String, timeoutMs: Int): Boolean
 fun ntpSync(server: String = "pool.ntp.org"): Boolean = ntpSync(server, 8000)
 
-/** Status code of the last [httpGet] (-1 = network error). */
+/** Status code of the last [httpGet] / [httpGetIfChanged] (-1 = network error). */
 external fun httpStatus(): Int
+/**
+ * Conditional GET: sends `If-None-Match: <etag>` when [etag] is not empty. An unchanged resource answers 304
+ * ([httpStatus]) with an empty body. The new ETag is in [httpEtag].
+ */
+external fun httpGetIfChanged(url: String, etag: String, timeoutMs: Int): String?
+/** `ETag` header of the last HTTP response ("" if none). */
+external fun httpEtag(): String
 external fun wsOpen(url: String, timeoutMs: Int): Int
 external fun wsPoll(handle: Int, timeoutMs: Int): String?
 external fun wsSend(handle: Int, text: String): Boolean
@@ -65,5 +72,24 @@ class WebSocket(val url: String) {
     fun close() {
         if (handle >= 0) wsClose(handle)
         handle = -1
+    }
+}
+
+/**
+ * Polls [url] with ETag/If-None-Match: [poll] returns the body when it changed, and null when it is unchanged
+ * ([status] 304) or on error (other [status], -1 = network error). The server only sends the body when it changed.
+ */
+class ConditionalGet(val url: String) {
+    var etag = ""
+        private set
+    var status = 0
+        private set
+
+    fun poll(timeoutMs: Int = 8000): String? {
+        val body = httpGetIfChanged(url, etag, timeoutMs)
+        status = httpStatus()
+        if (body == null || status < 200 || status > 299) return null
+        etag = httpEtag()
+        return body
     }
 }
