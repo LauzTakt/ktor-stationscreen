@@ -1,7 +1,11 @@
-# KTVM: Kotlin on the ESP32
+# Takt Station Screen
 
-Run **real Kotlin programs** (compiled with the official `kotlinc`) on an ESP32. The firmware is flashed once;
-after that, each program is compiled, linked and uploaded over USB in a few seconds.
+**KTVM: real Kotlin on the ESP32.** This is the station screen of [LauzTakt](https://github.com/LauzTakt), a real-time
+Swiss rail digital twin built at LauzHack 2026. A board that costs a few francs shows live departures, delays and
+incidents for one station, using a program written in normal Kotlin and compiled with the official `kotlinc`.
+
+The firmware (a small JVM) is flashed once. After that, each Kotlin program is compiled, trimmed, linked and uploaded
+over USB in a few seconds.
 
 ```kotlin
 import esp32.*
@@ -14,6 +18,97 @@ fun main() {
 
 ```sh
 ./ktesp run examples/Blink.kt      # compile + upload + show the serial output
+```
+
+## Architecture
+
+![LauzTakt architecture](docs/architecture.png)
+
+This repository is the **Kotlin2ESP tool** and the **ESP32** on the left of the diagram:
+
+- **Kotlin2ESP tool** (`ktesp`): compiles a Kotlin app with `kotlinc`, keeps only the code `main()` can reach and sends
+  the image to the board over **serial** (USB).
+- **ESP32**: runs the program on KTVM, our JVM bytecode interpreter in C++. It joins the WiFi, sets its clock with NTP
+  and polls the [Takt API](https://github.com/LauzTakt/ktor_app) over **HTTP** for its station.
+- **Display**: a real **ILI9341** TFT over SPI, or the same controller **emulated** on the laptop over USB.
+
+### The station screen in one picture
+
+```
+  your laptop                              the ESP32                          the internet
+  ───────────                              ─────────                          ────────────
+  Trains.kt                                firmware (flashed once)
+     │ kotlinc                             └─ KTVM: a small JVM
+     ▼                                        │
+  .class files                                │ boot: runs the last program
+     │ linker.py (keeps only                  │ from flash
+     │ what main() can reach)                 ▼
+     ▼                                     Trains.kt running ──── WiFi ────▶  NTP server (time)
+  program.ktv (~30 KB) ── USB ───────────▶    │                     │
+                                              │                     └─────▶  twin API (ktor_app)
+                                              │ ◀── a few lines of text ──     /screen.txt every 30 s
+                                              ▼
+                                           ILI9341 screen  (or the emulator on the laptop)
+```
+
+1. You write normal Kotlin. `./ktesp` compiles it, trims it down to what the program really uses and sends it
+   to the board over USB.
+2. The board keeps the program in flash and starts it on every power-up.
+3. The program joins the WiFi, gets the time from NTP, then asks the twin API for its station.
+4. The API answers with a tiny text summary (one line per train), or "nothing changed" (304).
+5. The board draws the departures, delays and incidents, and repaints only the parts that changed.
+
+Without a board, `./ktesp screen --sim` runs the same program on the laptop and draws it in a browser window.
+
+## Features
+
+- **Real Kotlin on a microcontroller:** classes, interfaces, data and sealed classes, enums, generics, lambdas,
+  collections, exceptions, `Long`/`Double` with exact JVM semantics.
+- **Small images:** a linker with Rapid Type Analysis keeps only reachable code (about 30 KB per program). Programs
+  run straight from flash and start at power-on.
+- **Station departure board** (`examples/trains`): departures, delays, cancellations, line pictograms and a rotating
+  incident banner. Only the zones that changed are repainted.
+- **Frugal networking:** about 250 bytes of text per poll from `GET /api/v1/stations/{id}/screen.txt`, with an ETag
+  and `304 Not Modified` when nothing changed.
+- **One image, many boards:** per-device settings in flash (`station`, `api`) so every board knows which station it
+  serves.
+- **No board needed:** a desktop simulator of the VM, an ILI9341 emulator that decodes the real controller protocol,
+  and a mock of the Takt API with buttons to create and resolve incidents.
+- **Same results everywhere:** the tests give the same output on the ESP32, in the simulator and on a real JVM.
+
+## Tech stack
+
+| Area | Technologies |
+|---|---|
+| Programs | Kotlin (official `kotlinc`, JVM bytecode), mini Java standard library (`runtime/shim/`) |
+| Toolchain | Python (linker, CLI, natives generator, screen emulator), Chrome app window for the emulator |
+| Firmware | C++, PlatformIO + Arduino, FreeRTOS, ESP32 |
+| Hardware | ESP32 (e.g. Cheap Yellow Display ESP32-2432S028R), ILI9341 320x240 SPI TFT |
+| Network | WiFi, NTP, HTTP/1.1 with ETag, WebSocket (https/wss optional) |
+
+## Project layout
+
+```
+ktesp                 CLI entry point (flash, run, sim, screen, config...)
+tools/                linker.py, classfile.py, natives.py, ktesp.py, screen.py + screen_ui.html, mock_api.py
+runtime/kotlin/esp32/ device API for Kotlin programs (hardware, net, json, screen)
+runtime/shim/         mini Java standard library
+runtime/natives.txt   native function table (the position is the id)
+firmware/             KTVM in C++ (PlatformIO): interpreter, GC, natives, ILI9341 driver
+host/                 the same VM built for the Mac (simulator)
+examples/             Blink, Button, Hello, Sensors, Interop, trains (station board)
+tests/                language, numbers, GC and crash tests
+```
+
+## Quick start
+
+```sh
+brew install kotlin openjdk@21
+cp examples/trains/Config.kt.example examples/trains/Config.kt   # WiFi, API, NTP server, display
+./ktesp flash                          # (once) build and flash the KTVM firmware
+./ktesp config station=8501120         # which station this board serves
+./ktesp screen examples/trains         # upload the station board and open the screen emulator
+./ktesp screen --sim examples/trains   # no board: run everything on the laptop
 ```
 
 ## How it works
@@ -46,7 +141,7 @@ fun main() {
    - https/wss need ~40 KB more (TLS), which is only kept free when the firmware is built with `TLS_RESERVE`.
 5. **`host/`** builds the same VM for the Mac (`./ktesp sim`), so you can test without a board.
 
-## Usage
+## Commands
 
 ```sh
 ./ktesp flash                       # (once) build and flash the KTVM firmware
@@ -207,3 +302,12 @@ The tests in `tests/` give **the same output on the ESP32, in the simulator and 
 Requires `brew install kotlin openjdk@21`. PlatformIO lives in `.pio-venv/` and the CLI uses `.venv/` (pyserial).
 On networks with TLS inspection (corporate proxy), `.ca-bundle.pem` holds the CAs of the system keychain so that
 PlatformIO can download packages.
+
+## Team
+
+[Latra](https://github.com/latra) · [Dídac Cayuela](https://github.com/didicayu) ·
+[David Sarrat González](https://github.com/davidsarrat) · [Sergi Simón Balcells](https://github.com/sergisi)
+
+Part of [LauzTakt](https://github.com/LauzTakt): [sbb-twin](https://github.com/LauzTakt/sbb-twin) (digital twin) ·
+[ktor_app](https://github.com/LauzTakt/ktor_app) (Takt backend and apps) ·
+[sbb-twin-mcp](https://github.com/LauzTakt/sbb-twin-mcp) (MCP server).
