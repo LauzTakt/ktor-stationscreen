@@ -1,0 +1,25 @@
+// Local configuration — copy this file to Config.kt and fill it in.
+package station
+
+import esp32.screen.Screen
+import esp32.screen.TftPins
+
+const val WIFI_SSID = "my-wifi"
+const val WIFI_PASSWORD = "my-password"
+
+/** The ktor_app backend (`/api/v1/stations/{stopId}/screen`). The simulator always uses 127.0.0.1. */
+const val API_HOST = "192.168.1.50"
+const val API_PORT = 8080
+
+/** The station this display belongs to (a stopId of the twin, e.g. 8501120 = Lausanne). */
+const val STATION_ID = "8501120"
+
+/** true = no network: the board shows sample departures and disruptions (see Demo.kt). */
+const val DEMO = true
+
+/**
+ * Display: the ILI9341 emulated on the computer (`./ktesp screen examples/station`), or a real one on SPI, e.g.
+ *   Screen.ili9341(TftPins.CYD)      ESP32-2432S028R "Cheap Yellow Display"
+ *   Screen.ili9341(TftPins.DEVKIT)   ESP32 DevKit + ILI9341 module (SCK18 MOSI23 MISO19 CS15 DC2 RST4)
+ */
+fun createScreen(): Screen = Screen.simulated(rotation = 1)

@@ -97,6 +97,26 @@ departure board on a 320x240 TFT: red header with the clock, white background, l
 With `DEMO = true` in `Config.kt` the board needs no network: `Demo.kt` replays built-in sample disruptions
 around Lausanne through the same JSON parsing and enrichment code.
 
+### Station departure board (SBB look)
+
+`examples/station/` is the station screen in the visual language of SBB (`ktor_app/docs/STYLE.md`): a white surface,
+charcoal text, red only for long-distance line labels, delays, cancellations and disruptions, sentence case.
+It polls `GET /api/v1/stations/{stopId}/screen` of ktor_app every 5 s and draws the next five departures
+(time, line label, destination, delay or "Cancelled" under the time, "At station" in blue) and, below, the incidents that
+concern the station, one at a time, or a green "No disruptions". The display has one 6x8 font, so hierarchy comes from
+size (2x for time and destination), a doubled stroke for bold and the layout. A destination that does not fit at 2x is
+shown whole at 1x. Times use Swiss local time with daylight saving.
+
+```sh
+cp examples/station/Config.kt.example examples/station/Config.kt   # set WIFI_*, API_HOST, STATION_ID, DEMO
+./ktesp screen examples/station
+```
+
+With `DEMO = true` it needs no network: `Demo.kt` builds sample departures in the shape of ktor_app's `Screen` JSON,
+anchored to the board's clock, and alternates a disruption footer with the calm one.
+
+![Station board](docs/station-board.png)
+
 `./ktesp screen` (`tools/screen.py` + `tools/screen_ui.html`) is the Mac app, opened as a Chrome app window:
 - it reads the serial port (or the simulator), separates the display traffic from the console text and shows the
   emulated TFT;

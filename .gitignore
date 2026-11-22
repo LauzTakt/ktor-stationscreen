@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 .DS_Store
 examples/trains/Config.kt
+examples/station/Config.kt

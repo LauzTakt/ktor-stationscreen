@@ -86,7 +86,9 @@ int hal_tcp_connect(const char* host, int port, bool tls, int timeout_ms) {
   if (fd >= 0) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    #ifdef SO_NOSIGPIPE // macOS only; on Linux the sends use MSG_NOSIGNAL or SIGPIPE is ignored
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    #endif
   }
   return fd;
 }
