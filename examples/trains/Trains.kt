@@ -171,40 +171,60 @@ fun fields(text: String, start: Int, end: Int): ArrayList<String> {
 }
 
 // ------------------------------------------------------------------ drawing (320x240)
-// Swiss railway board style: red header, white background, grey scale, hairline separators.
+// Same look as the twin apps (ktor_app docs/STYLE.md, SBB visual language without SBB logo or pictograms): white calm
+// surface, greys for structure, red only for alerts and delays, colours that always mean the same thing, words next to
+// every colour. Sized for a hall display read from a distance: big bold times and destinations, little else.
 const val RED = 0xEB0000
 const val CHARCOAL = 0x212121
-const val GRANITE = 0x686868
+const val IRON = 0x444444
 const val METAL = 0x767676
+const val SMOKE = 0x8D8D8D
 const val SILVER = 0xDCDCDC
+const val CLOUD = 0xE5E5E5
 const val MILK = 0xF6F6F6
 const val WHITE = 0xFFFFFF
 const val BLUE = 0x2D327D
+const val SKY = 0x0079C7
+const val GREEN = 0x00973B
+const val ORANGE = 0xF27E00
 const val SCREEN_BG = WHITE
 
-const val HEADER_H = 28
-const val BANNER_H = 34
+const val HEADER_H = 36
+const val BANNER_H = 40
 const val COLS_H = 14
-const val ROW_H = 28
-const val FOOTER_H = 16
+const val ROW_H = 30
+const val FOOTER_H = 18
+const val PAD = 8
 
+/** Status dot colour of an incident (STYLE.md section 4): red interrupted, orange limited, sky information. */
 fun severityColor(s: Severity) = when (s) {
-    Severity.CRITICAL -> RED
-    Severity.MAJOR -> 0xF27E00
-    Severity.MINOR -> 0xFCBB00
-    Severity.INFO -> BLUE
+    Severity.CRITICAL, Severity.MAJOR -> RED
+    Severity.MINOR -> ORANGE
+    Severity.INFO -> SKY
 }
 
-fun bannerBg(s: Severity) = when (s) {
-    Severity.CRITICAL, Severity.MAJOR -> 0xFDECEC
-    Severity.MINOR -> 0xFFF6DB
-    Severity.INFO -> MILK
+fun severityWord(s: Severity) = when (s) {
+    Severity.CRITICAL -> "Interrupted"
+    Severity.MAJOR -> "Disruption"
+    Severity.MINOR -> "Delays possible"
+    Severity.INFO -> "Information"
 }
 
-fun isLongDistance(category: String): Boolean {
-    val c = category.uppercase()
-    return c == "IC" || c == "IR" || c == "EC" || c == "ICE" || c == "TGV" || c == "ICN" || c == "RJX" ||
-        c == "EN" || c == "NJ"
+/** Bold for the 5x7 font: the text drawn twice, one pixel apart. */
+fun bold(s: Screen, x: Int, y: Int, text: String, c: Int, size: Int, bg: Int) {
+    s.text(x, y, text, c, size, bg)
+    s.text(x + 1, y, text, c, size, Color.NONE)
+}
+
+/** Brand mark (STYLE.md section 6): a white train on a red square. */
+fun brandMark(s: Screen, x: Int, y: Int) {
+    s.fillRoundRect(x, y, 24, 24, 5, RED)
+    s.fillRoundRect(x + 5, y + 5, 14, 11, 3, WHITE)      // body
+    s.fillRect(x + 7, y + 7, 10, 4, RED)                   // windscreen
+    s.fillRect(x + 7, y + 13, 2, 2, RED)                   // lights
+    s.fillRect(x + 15, y + 13, 2, 2, RED)
+    s.fillRect(x + 7, y + 17, 2, 2, WHITE)                 // wheels
+    s.fillRect(x + 15, y + 17, 2, 2, WHITE)
 }
 
 /**
@@ -227,46 +247,53 @@ class Renderer(val s: Screen) {
             for (i in rowKeys.indices) rowKeys[i] = null
             val top = HEADER_H + (if (hasBanner) BANNER_H else 0)
             s.fillRect(0, top, w, COLS_H, SCREEN_BG)
-            s.text(8, top + 4, "Departure", METAL, 1, SCREEN_BG)
-            s.text(98, top + 4, "Line", METAL, 1, SCREEN_BG)
-            s.text(138, top + 4, "Destination", METAL, 1, SCREEN_BG)
+            s.text(PAD, top + 4, "Departure", METAL, 1, SCREEN_BG)
+            s.text(100, top + 4, "Line", METAL, 1, SCREEN_BG)
+            s.text(146, top + 4, "Destination", METAL, 1, SCREEN_BG)
         }
 
-        // header: station + clock (repainted when the minute changes)
+        // header: brand mark, station, clock (repainted when the minute changes)
         val clock = if (b.hasData || epochMillis() > 0) hhmm(b.nowMs()) else ""
         val hk = "${b.title}|$clock"
         if (hk != headerKey) {
             headerKey = hk
-            s.fillRect(0, 0, w, HEADER_H, RED)
-            val clockW = if (clock.isEmpty()) 0 else Screen.textWidth(clock, 2) + 12
-            s.text(10, 7, Screen.ellipsize(b.title, w - 20 - clockW, 2), WHITE, 2, RED)
-            if (clock.isNotEmpty()) s.textRight(w - 10, 7, clock, WHITE, 2, RED)
+            s.fillRect(0, 0, w, HEADER_H, SCREEN_BG)
+            brandMark(s, PAD, 6)
+            val clockW = if (clock.isEmpty()) 0 else Screen.textWidth(clock, 2) + 16
+            bold(s, PAD + 32, 11, Screen.ellipsize(b.title, w - PAD * 2 - 34 - clockW, 2), CHARCOAL, 2, SCREEN_BG)
+            if (clock.isNotEmpty()) bold(s, w - PAD - Screen.textWidth(clock, 2) - 1, 11, clock, CHARCOAL, 2, SCREEN_BG)
+            s.drawLine(0, HEADER_H - 1, w, HEADER_H - 1, SILVER)
         }
 
-        // incident banner (rotates every few seconds when there are several)
+        // incident card (rotates every few seconds when there are several): status dot + word + title
         if (hasBanner) {
             val n = b.incidents.size
             val inc = b.incidents[tick % n]
             val counter = if (n > 1) "${tick % n + 1}/$n" else ""
-            val bk = "${inc.severity}|${inc.title}|${inc.trains}|$counter"
+            val bk = "${inc.severity}|${inc.title}|${inc.where}|${inc.trains}|$counter"
             if (bk != bannerKey) {
                 bannerKey = bk
                 val y = HEADER_H
-                val bg = bannerBg(inc.severity)
-                s.fillRect(0, y, w, BANNER_H, bg)
-                s.fillRect(0, y, 4, BANNER_H, severityColor(inc.severity))
+                s.fillRect(0, y, w, BANNER_H, SCREEN_BG)
+                s.fillRoundRect(4, y + 3, w - 8, BANNER_H - 6, 8, CLOUD)
+                s.fillRoundRect(5, y + 4, w - 10, BANNER_H - 8, 7, MILK)
+                val dot = severityColor(inc.severity)
+                s.fillCircle(PAD + 7, y + 13, 4, dot)
+                val word = severityWord(inc.severity)
+                bold(s, PAD + 16, y + 9, word, if (dot == SKY) BLUE else dot, 1, MILK)
+                if (counter.isNotEmpty()) s.textRight(w - PAD - 4, y + 9, counter, METAL, 1, MILK)
+                val tx = PAD + 16 + Screen.textWidth(word) + 8
                 val cw = if (counter.isEmpty()) 0 else Screen.textWidth(counter) + 8
-                if (counter.isNotEmpty()) s.textRight(w - 8, y + 5, counter, METAL, 1, bg)
-                val lines = Screen.wrap(inc.title, w - 18 - cw, 1, 2)
-                s.text(12, y + 5, lines[0], CHARCOAL, 1, bg)
+                s.text(tx, y + 9, Screen.ellipsize(inc.title, w - tx - PAD - 4 - cw), CHARCOAL, 1, MILK)
                 val trains = "${inc.trains} train${if (inc.trains == 1) "" else "s"}"
-                val second = when {
-                    lines.size > 1 -> lines[1]
+                val detail = when {
+                    inc.where.isNotEmpty() && inc.trains > 0 -> "${inc.where} · $trains affected"
+                    inc.where.isNotEmpty() -> inc.where
                     !inc.atStation -> "Affects $trains calling here"
                     inc.trains > 0 -> "At this station · $trains affected"
                     else -> "At this station"
                 }
-                s.text(12, y + 19, Screen.ellipsize(second, w - 20), GRANITE, 1, bg)
+                s.text(PAD + 16, y + 22, Screen.ellipsize(detail, w - PAD * 2 - 20), METAL, 1, MILK)
             }
         }
 
@@ -275,12 +302,12 @@ class Renderer(val s: Screen) {
         val bottom = s.height - FOOTER_H
         val rows = minOf(ROWS_MAX, (bottom - top) / ROW_H)
         if (!b.hasData || b.departures.isEmpty()) {
-            val msg = if (!b.hasData) "Loading departures..." else "No departures in the next 2 hours"
+            val msg = if (!b.hasData) "Loading departures..." else "No departures in the next 2 hours."
             if (rowKeys[0] != "msg:$msg") {
                 for (i in rowKeys.indices) rowKeys[i] = null
                 rowKeys[0] = "msg:$msg"
                 s.fillRect(0, top, w, bottom - top, SCREEN_BG)
-                s.textCentered(0, w, top + (bottom - top) / 2 - 4, msg, GRANITE, 1, SCREEN_BG)
+                s.textCentered(0, w, top + (bottom - top) / 2 - 4, msg, METAL, 1, SCREEN_BG)
             }
         } else {
             if (rowKeys[0]?.startsWith("msg:") == true) {
@@ -291,7 +318,7 @@ class Renderer(val s: Screen) {
                 val d = if (i < b.departures.size) b.departures[i] else null
                 val sep = d != null && i < b.departures.size - 1 && i < rows - 1
                 val key = if (d == null) "" else
-                    "${d.planned}|${d.delayMin}|${d.line}|${d.category}|${d.destination}|${d.cancelled}|$sep"
+                    "${d.planned}|${d.delayMin}|${d.line}|${d.destination}|${d.cancelled}|${d.atStation}|$sep"
                 if (key != rowKeys[i]) {
                     rowKeys[i] = key
                     val y = top + i * ROW_H
@@ -306,69 +333,78 @@ class Renderer(val s: Screen) {
             }
         }
 
-        // footer
+        // footer: station id, live state (green dot + word, or red when offline), age of the data
+        val ok = b.live || b.demo
         val source = if (b.demo) "Demo" else if (b.live) "Live" else b.status
-        val right = if (!b.hasData) source else "$source · ${ago(((millis() - b.lastUpdateMs) / 1000).toLong())}"
-        val fk = "${b.stationId}|$right|${b.live || b.demo}"
+        val right = if (!b.hasData) source else "$source · updated ${ago(((millis() - b.lastUpdateMs) / 1000).toLong())}"
+        val fk = "${b.stationId}|$right|$ok"
         if (fk != footerKey) {
             footerKey = fk
             s.fillRect(0, bottom, w, FOOTER_H, SCREEN_BG)
             s.drawLine(0, bottom, w, bottom, SILVER)
-            s.text(8, bottom + 5, "ID ${b.stationId}", METAL, 1, SCREEN_BG)
-            s.textRight(w - 8, bottom + 5, right, if (b.live || b.demo) METAL else RED, 1, SCREEN_BG)
+            s.text(PAD, bottom + 6, "Station ${b.stationId}", METAL, 1, SCREEN_BG)
+            val rw = Screen.textWidth(right)
+            s.textRight(w - PAD, bottom + 6, right, if (ok) METAL else RED, 1, SCREEN_BG)
+            s.fillCircle(w - PAD - rw - 7, bottom + 9, 3, if (ok) GREEN else RED)
         }
     }
 
     private fun row(d: Departure, y: Int, separator: Boolean) {
         val w = s.width
-        val main = if (d.cancelled) METAL else CHARCOAL
-        s.text(8, y + 6, d.planned, main, 2, SCREEN_BG)
-        if (!d.cancelled && d.delayMin >= 1) s.text(70, y + 10, "+${d.delayMin}'", RED, 1, SCREEN_BG)
-        badge(98, y + 6, d.line, d.category)
-        val right = w - 8
-        var avail = right - 138
+        // time: bold charcoal; cancelled = struck through in metal; delay after it in red with a prime
         if (d.cancelled) {
-            s.textRight(right, y + 10, "Cancelled", RED, 1, SCREEN_BG)
-            avail -= Screen.textWidth("Cancelled") + 6
+            s.text(PAD, y + 7, d.planned, METAL, 2, SCREEN_BG)
+            s.fillRect(PAD - 1, y + 14, Screen.textWidth(d.planned, 2) + 1, 2, METAL)
+        } else {
+            bold(s, PAD, y + 7, d.planned, CHARCOAL, 2, SCREEN_BG)
+            if (d.delayMin >= 1) bold(s, PAD + 63, y + 11, "+${d.delayMin}'", RED, 1, SCREEN_BG)
         }
+        chip(100, y + 7, d.line)
+        // right edge: "Cancelled" in red, or "Now" in blue for a train standing at the station
+        val right = w - PAD
+        var avail = right - 146
+        val tag = if (d.cancelled) "Cancelled" else if (d.atStation) "Now" else ""
+        if (tag.isNotEmpty()) {
+            bold(s, right - Screen.textWidth(tag) - 1, y + 11, tag, if (d.cancelled) RED else BLUE, 1, SCREEN_BG)
+            avail -= Screen.textWidth(tag) + 8
+        }
+        val main = if (d.cancelled) SMOKE else CHARCOAL
         // big letters when the destination fits, otherwise small ones (complete rather than cut)
-        if (Screen.textWidth(d.destination, 2) <= avail) s.text(138, y + 6, d.destination, main, 2, SCREEN_BG)
-        else s.text(138, y + 10, Screen.ellipsize(d.destination, avail), main, 1, SCREEN_BG)
-        if (separator) s.drawLine(8, y + ROW_H - 1, w, y + ROW_H - 1, SILVER)
+        if (Screen.textWidth(d.destination, 2) + 1 <= avail) bold(s, 146, y + 7, d.destination, main, 2, SCREEN_BG)
+        else bold(s, 146, y + 11, Screen.ellipsize(d.destination, avail - 1), main, 1, SCREEN_BG)
+        if (separator) s.drawLine(PAD, y + ROW_H - 1, w - PAD, y + ROW_H - 1, CLOUD)
     }
 
-    /** Long-distance products filled red, regional ones outlined (timetable pictogram style). */
-    private fun badge(x: Int, y: Int, line: String, category: String) {
-        val bw = 34
-        val bh = 16
-        val text = Screen.ellipsize(line, bw - 4)
-        if (isLongDistance(category)) {
-            s.fillRect(x, y, bw, bh, RED)
-            s.textCentered(x, bw, y + 4, text, WHITE, 1, RED)
-        } else {
-            s.fillRect(x, y, bw, bh, WHITE)
-            s.drawRect(x, y, bw, bh, CHARCOAL)
-            s.textCentered(x, bw, y + 4, text, CHARCOAL, 1, WHITE)
-        }
+    /** Line as a neutral chip (pill, 1 px iron border): no SBB pictograms. */
+    private fun chip(x: Int, y: Int, line: String) {
+        val text = Screen.ellipsize(line, 36)
+        val cw = maxOf(30, Screen.textWidth(text) + 10)
+        s.fillRoundRect(x, y, cw, 16, 8, IRON)
+        s.fillRoundRect(x + 1, y + 1, cw - 2, 14, 7, WHITE)
+        bold(s, x + (cw - Screen.textWidth(text)) / 2, y + 4, text, CHARCOAL, 1, WHITE)
     }
 }
 
-fun splash(s: Screen, line1: String, line2: String) {
+fun header(s: Screen, title: String) {
     s.clear(SCREEN_BG)
-    s.fillRect(0, 0, s.width, HEADER_H, RED)
-    s.text(10, 7, "Departures", WHITE, 2, RED)
-    s.textCentered(0, s.width, 100, line1, CHARCOAL, 1, SCREEN_BG)
-    s.textCentered(0, s.width, 116, line2, METAL, 1, SCREEN_BG)
+    brandMark(s, PAD, 6)
+    bold(s, PAD + 32, 11, title, CHARCOAL, 2, SCREEN_BG)
+    s.drawLine(0, HEADER_H - 1, s.width, HEADER_H - 1, SILVER)
+}
+
+fun splash(s: Screen, line1: String, line2: String) {
+    header(s, "Departures")
+    bold(s, (s.width - Screen.textWidth(line1, 2)) / 2, 108, line1, CHARCOAL, 2, SCREEN_BG)
+    s.textCentered(0, s.width, 132, line2, METAL, 1, SCREEN_BG)
 }
 
 /** The time just set by NTP, large, while the first departures are fetched. */
 fun showClock(s: Screen) {
-    s.clear(SCREEN_BG)
-    s.fillRect(0, 0, s.width, HEADER_H, RED)
-    s.text(10, 7, "Departures", WHITE, 2, RED)
-    s.textCentered(0, s.width, 90, hhmm(epochMillis()), CHARCOAL, 6, SCREEN_BG)
-    s.textCentered(0, s.width, 150, "Swiss time, set by NTP", METAL, 1, SCREEN_BG)
-    s.textCentered(0, s.width, 166, "Loading departures...", METAL, 1, SCREEN_BG)
+    header(s, "Departures")
+    val t = hhmm(epochMillis())
+    bold(s, (s.width - Screen.textWidth(t, 6)) / 2, 82, t, CHARCOAL, 6, SCREEN_BG)
+    s.textCentered(0, s.width, 146, "Swiss time", METAL, 1, SCREEN_BG)
+    s.textCentered(0, s.width, 176, "Loading departures...", METAL, 1, SCREEN_BG)
 }
 
 // ------------------------------------------------------------------ main
